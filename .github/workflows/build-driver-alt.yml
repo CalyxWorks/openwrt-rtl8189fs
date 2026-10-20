@@ -12,8 +12,6 @@ jobs:
     timeout-minutes: 30
 
     env:
-      HDR: ${{ runner.temp }}/headers
-      DRIVER: ${{ runner.temp }}/driver/rtl8189fs-armbian
       CROSS_COMPILE: aarch64-none-linux-gnu-
 
     steps:
@@ -21,68 +19,121 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install host dependencies
+        shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y build-essential bc bison flex \
-            libssl-dev libelf-dev dwarves xz-utils curl tar
+          sudo apt-get install -y \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev dwarves \
+            xz-utils curl tar
 
       - name: Download ARM GNU cross-compiler
+        shell: bash
         run: |
           set -euxo pipefail
+
           URL="https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/15.3.rel1/arm-gnu-toolchain-15.3.rel1-x86_64-aarch64-none-linux-gnu.tar.xz"
+
           curl -fL "$URL" -o "$RUNNER_TEMP/arm-toolchain.tar.xz"
           mkdir -p "$RUNNER_TEMP/toolchain"
-          tar -xJf "$RUNNER_TEMP/arm-toolchain.tar.xz" \
-            -C "$RUNNER_TEMP/toolchain" --strip-components=1
-          echo "$RUNNER_TEMP/toolchain/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-gcc" --version
 
-      - name: Download kernel headers artifact
+          tar -xJf "$RUNNER_TEMP/arm-toolchain.tar.xz" \
+            -C "$RUNNER_TEMP/toolchain" \
+            --strip-components=1
+
+          echo "$RUNNER_TEMP/toolchain/bin" >> "$GITHUB_PATH"
+
+          "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-gcc" \
+            --version
+
+      - name: Locate and extract kernel headers
+        shell: bash
         run: |
           set -euxo pipefail
+
+          ARCHIVE="$(find "$GITHUB_WORKSPACE" -type f \
+            -name 'header-6.18.57-ophub.tar.gz' -print -quit)"
+
+          if [ -z "$ARCHIVE" ]; then
+            echo "::error::header-6.18.57-ophub.tar.gz was not found in the repository."
+            exit 1
+          fi
+
+          HDR="$RUNNER_TEMP/headers"
           mkdir -p "$HDR"
-          tar -xzf header-6.18.57-ophub.tar.gz \
-            -C "$HDR" --strip-components=1
+
+          tar -xzf "$ARCHIVE" -C "$HDR" --strip-components=1
 
           test -f "$HDR/Makefile"
           test -f "$HDR/Module.symvers"
           test -f "$HDR/include/generated/autoconf.h"
 
+          echo "Kernel header archive: $ARCHIVE"
+          echo "Extracted headers: $HDR"
+
       - name: Prepare kernel build utilities
+        shell: bash
         run: |
           set -euxo pipefail
+
+          HDR="$RUNNER_TEMP/headers"
           export ARCH=arm64
           export CROSS_COMPILE="$CROSS_COMPILE"
 
-          make -C "$HDR" \
-            ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
-            scripts
+          # Rebuild host-side utilities when the archive omits them.
+          if [ ! -x "$HDR/scripts/mod/modpost" ]; then
+            make -C "$HDR" \
+              ARCH="$ARCH" \
+              CROSS_COMPILE="$CROSS_COMPILE" \
+              scripts
+          fi
 
-          test -x "$HDR/scripts/mod/modpost"
+          if [ ! -x "$HDR/scripts/mod/modpost" ]; then
+            echo "::error::modpost is still missing after preparing kernel scripts."
+            exit 1
+          fi
 
       - name: Download alternative RTL8189FS source
+        shell: bash
         run: |
           set -euxo pipefail
+
+          DRIVER="$RUNNER_TEMP/driver/rtl8189fs-armbian"
           mkdir -p "$DRIVER"
 
           curl -fL \
-            https://github.com/gustiarto/rtl8189fs-armbian/archive/refs/heads/main.tar.gz \
+            "https://github.com/gustiarto/rtl8189fs-armbian/archive/refs/heads/main.tar.gz" \
             -o "$RUNNER_TEMP/rtl8189fs-armbian.tar.gz"
 
           tar -xzf "$RUNNER_TEMP/rtl8189fs-armbian.tar.gz" \
-            --strip-components=1 -C "$DRIVER"
+            --strip-components=1 \
+            -C "$DRIVER"
+
+          test -f "$DRIVER/Makefile"
+          test -f "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
 
           sed -i \
             's/^CONFIG_IPS_MODE[[:space:]]*=.*/CONFIG_IPS_MODE = 0/' \
             "$DRIVER/Makefile"
 
+          echo "=== Driver configuration ==="
           grep -n -E 'CONFIG_POWER_SAVING|CONFIG_IPS_MODE' \
             "$DRIVER/Makefile"
 
+          echo "=== cfg80211 compatibility guards ==="
+          grep -n -E \
+            'KERNEL_VERSION\(7, [123], 0\)|cfg80211_new_sta|cfg80211_del_sta' \
+            "$DRIVER/os_dep/linux/ioctl_cfg80211.c" || true
+
       - name: Build alternative driver
+        shell: bash
         run: |
           set -euxo pipefail
+
+          HDR="$RUNNER_TEMP/headers"
+          DRIVER="$RUNNER_TEMP/driver/rtl8189fs-armbian"
+
           export ARCH=arm64
           export CROSS_COMPILE="$CROSS_COMPILE"
 
@@ -94,13 +145,18 @@ jobs:
             modules
 
           test -s "$DRIVER/8189fs.ko"
+
           "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-readelf" \
             -h "$DRIVER/8189fs.ko"
+
           "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-nm" \
             -u "$DRIVER/8189fs.ko" \
             > "$RUNNER_TEMP/undefined-symbols.txt"
 
-      - name: Upload build results
+          modinfo "$DRIVER/8189fs.ko" \
+            > "$RUNNER_TEMP/module-info.txt" || true
+
+      - name: Upload build results and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -109,4 +165,5 @@ jobs:
             ${{ runner.temp }}/driver/rtl8189fs-armbian/8189fs.ko
             ${{ runner.temp }}/driver/rtl8189fs-armbian/Module.symvers
             ${{ runner.temp }}/undefined-symbols.txt
+            ${{ runner.temp }}/module-info.txt
           if-no-files-found: warn
