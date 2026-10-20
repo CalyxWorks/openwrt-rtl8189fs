@@ -83,6 +83,15 @@ jobs:
           echo "===== HEADER TREE ====="
           ls -lh "$HDR/Module.symvers" "$HDR/Makefile"
 
+      - name: Rebuild kernel build helpers
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          make -C "$HDR" scripts
+          file "$HDR/scripts/basic/fixdep"
+          "$HDR/scripts/basic/fixdep" 2>&1 || true
+          
       - name: Build kernel module
         shell: bash
         run: |
