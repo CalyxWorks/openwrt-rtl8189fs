@@ -1,7 +1,19 @@
-name: Build Alternative RTL8189FS for OpenWrt 6.18.57
+name: Build RTL8189FS for OpenWrt 6.18.57
 
 on:
   workflow_dispatch:
+    inputs:
+      audit_only:
+        description: "Audit cfg80211 compatibility only; do not compile"
+        required: true
+        type: boolean
+        default: true
+  push:
+    paths:
+      - "build-driver.yml"
+      - "kernel-6.18.57.config"
+      - "header-6.18.57-ophub.tar.gz"
+      - ".github/workflows/build-driver.yml"
 
 permissions:
   contents: read
@@ -15,72 +27,82 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install build utilities
+      - name: Check uploaded inputs
         shell: bash
         run: |
           set -euxo pipefail
+          test -s kernel-6.18.57.config
+          test -s header-6.18.57-ophub.tar.gz
+          sha256sum kernel-6.18.57.config header-6.18.57-ophub.tar.gz
+
+      - name: Install build utilities
+        run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential bc bison flex \
-            libssl-dev libelf-dev dwarves xz-utils curl
+          sudo apt-get install -y build-essential bc bison flex \
+            libssl-dev libelf-dev dwarves xz-utils
 
       - name: Install matching Arm GCC
         shell: bash
         run: |
           set -euxo pipefail
           URL="https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/15.3.rel1/arm-gnu-toolchain-15.3.rel1-x86_64-aarch64-none-linux-gnu.tar.xz"
-
-          curl -fL --retry 3 "$URL" \
-            -o "$RUNNER_TEMP/arm-gcc.tar.xz"
+          curl -fL --retry 3 "$URL" -o "$RUNNER_TEMP/arm-gcc.tar.xz"
           mkdir -p "$RUNNER_TEMP/arm-gcc"
           tar -xJf "$RUNNER_TEMP/arm-gcc.tar.xz" \
             -C "$RUNNER_TEMP/arm-gcc" --strip-components=1
-
           echo "$RUNNER_TEMP/arm-gcc/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/arm-gcc/bin/aarch64-none-linux-gnu-gcc" \
-            --version
+          "$RUNNER_TEMP/arm-gcc/bin/aarch64-none-linux-gnu-gcc" --version
 
-      - name: Download alternative driver source
+      - name: Download alternative RTL8189FS source
         shell: bash
         run: |
           set -euxo pipefail
-          DRIVER="$RUNNER_TEMP/driver/rtl8189fs-armbian"
-          mkdir -p "$DRIVER"
+          mkdir -p "$RUNNER_TEMP/driver" "$RUNNER_TEMP/headers"
 
           curl -fL --retry 3 \
             "https://github.com/gustiarto/rtl8189fs-armbian/archive/refs/heads/main.tar.gz" \
-            -o "$RUNNER_TEMP/rtl8189fs-armbian.tar.gz"
+            -o "$RUNNER_TEMP/rtl8189fs-source.tar.gz"
 
-          tar -xzf "$RUNNER_TEMP/rtl8189fs-armbian.tar.gz" \
-            --strip-components=1 -C "$DRIVER"
+          tar -xzf "$RUNNER_TEMP/rtl8189fs-source.tar.gz" \
+            -C "$RUNNER_TEMP/driver"
 
+          DRIVER_FILE="$(find "$RUNNER_TEMP/driver" -type f \
+            -path '*/os_dep/linux/ioctl_cfg80211.c' -print -quit)"
+          test -n "$DRIVER_FILE"
+
+          DRIVER="$(dirname "$(dirname "$(dirname "$DRIVER_FILE")")")"
           test -f "$DRIVER/Makefile"
-          test -f "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
-
-          sed -i \
-            's/^CONFIG_IPS_MODE[[:space:]]*=.*/CONFIG_IPS_MODE = 0/' \
-            "$DRIVER/Makefile"
-
-          grep -n -E 'CONFIG_POWER_SAVING|CONFIG_IPS_MODE' \
-            "$DRIVER/Makefile"
 
           echo "DRIVER=$DRIVER" >> "$GITHUB_ENV"
+          echo "===== DRIVER SOURCE ====="
+          echo "$DRIVER"
+
+          echo "===== IPS CONFIGURATION BEFORE CHANGE ====="
+          grep -n 'CONFIG_IPS_MODE' "$DRIVER/Makefile" || true
+
+          if grep -q '^[[:space:]]*CONFIG_IPS_MODE[[:space:]]*=' \
+            "$DRIVER/Makefile"; then
+            sed -i \
+              's/^[[:space:]]*CONFIG_IPS_MODE[[:space:]]*=.*/CONFIG_IPS_MODE = 0/' \
+              "$DRIVER/Makefile"
+          else
+            echo "ERROR: CONFIG_IPS_MODE setting not found in Makefile"
+            exit 1
+          fi
+
+          echo "===== IPS CONFIGURATION AFTER CHANGE ====="
+          grep -n 'CONFIG_IPS_MODE' "$DRIVER/Makefile"
 
       - name: Extract kernel headers
         shell: bash
         run: |
           set -euxo pipefail
-
-          test -s header-6.18.57-ophub.tar.gz
-
-          mkdir -p "$RUNNER_TEMP/headers"
           tar -xzf header-6.18.57-ophub.tar.gz \
             -C "$RUNNER_TEMP/headers"
 
           SYMVERS="$(find "$RUNNER_TEMP/headers" \
             -type f -name Module.symvers -print -quit)"
           test -n "$SYMVERS"
-
           HDR="$(dirname "$SYMVERS")"
 
           test -f "$HDR/Makefile"
@@ -90,8 +112,11 @@ jobs:
 
           echo "HDR=$HDR" >> "$GITHUB_ENV"
 
-          echo "=== Kernel release ==="
+          echo "===== KERNEL RELEASE ====="
           cat "$HDR/include/generated/utsrelease.h"
+
+          echo "===== HEADER TREE ====="
+          ls -lh "$HDR/Module.symvers" "$HDR/Makefile"
 
       - name: Rebuild fixdep for GitHub runner
         shell: bash
@@ -119,10 +144,71 @@ jobs:
             -o "$HDR/scripts/basic/fixdep" \
             "$HDR/scripts/basic/fixdep.c"
 
+          echo "===== HOST TOOL FORMATS ====="
           file "$HDR/scripts/basic/fixdep"
           file "$HDR/scripts/mod/modpost"
 
+      - name: Audit cfg80211 compatibility across driver
+        shell: bash
+        run: |
+          set -eu
+          SRC="$DRIVER"
+
+          echo "===== ALL 7.1.0 GUARDS IN DRIVER ====="
+          grep -R -n -B 5 -A 10 \
+            --include='*.c' --include='*.h' \
+            'KERNEL_VERSION(7, 1, 0)' "$SRC" || true
+
+          echo "===== OTHER RELEVANT VERSION GUARDS ====="
+          grep -R -n -E \
+            --include='*.c' --include='*.h' \
+            'KERNEL_VERSION\((6|7),[[:space:]]*[0-9]+,[[:space:]]*[0-9]+\)' \
+            "$SRC/os_dep/linux" | grep -E \
+            'cfg80211|ioctl_cfg80211|7, 1|7, 2|7, 3' | head -200 || true
+
+          FILE="$SRC/os_dep/linux/ioctl_cfg80211.c"
+
+          echo "===== STATION CALLBACK DEFINITIONS ====="
+          grep -n -B 8 -A 24 -E \
+            'cfg80211_rtw_(get_station|add_station|del_station|change_station|dump_station)\(' \
+            "$FILE" || true
+
+          echo "===== REMAIN-ON-CHANNEL AND MGMT-TX DEFINITIONS ====="
+          grep -n -B 8 -A 35 -E \
+            'cfg80211_rtw_(remain_on_channel|cancel_remain_on_channel|mgmt_tx)\(' \
+            "$FILE" || true
+
+          echo "===== STATION NOTIFICATION CALLS ====="
+          grep -R -n -B 6 -A 8 -E \
+            'cfg80211_(new_sta|del_sta)\(' "$SRC" || true
+
+      - name: Diagnose actual cfg80211 header API
+        shell: bash
+        run: |
+          set -eu
+
+          echo "===== HEADER KERNEL VERSION ====="
+          grep -R -n 'LINUX_VERSION_CODE' \
+            "$HDR/include/generated" "$HDR/include/linux" \
+            2>/dev/null | head -30 || true
+
+          echo "===== CFG80211 CALLBACK SIGNATURES ====="
+          grep -n -B 4 -A 8 -E \
+            '\(\*(get_station|add_station|del_station|change_station|dump_station|remain_on_channel|cancel_remain_on_channel|mgmt_tx)\)' \
+            "$HDR/include/net/cfg80211.h" || true
+
+          echo "===== RELEVANT HEADER STRUCTS AND PROTOTYPES ====="
+          grep -n -B 5 -A 10 -E \
+            'struct cfg80211_ops|struct station_parameters|cfg80211_new_sta\(|cfg80211_del_sta\(' \
+            "$HDR/include/net/cfg80211.h" || true
+
+          echo "===== DRIVER VERSION GUARDS AND CALLBACK REFERENCES ====="
+          grep -n -E \
+            'KERNEL_VERSION\(7, 1, 0\)|KERNEL_VERSION\(7, 2, 0\)|KERNEL_VERSION\(7, 3, 0\)|cfg80211_rtw_(get_station|add_station|del_station|change_station|dump_station|remain_on_channel|cancel_remain_on_channel|mgmt_tx)' \
+            "$DRIVER/os_dep/linux/ioctl_cfg80211.c" | tail -100 || true
+
       - name: Build kernel module
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.audit_only != true }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -130,34 +216,35 @@ jobs:
           export CROSS_COMPILE=aarch64-none-linux-gnu-
 
           cd "$DRIVER"
-
-          make -j2 ARCH="$ARCH" \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            KSRC="$HDR" \
-            KVER=6.18.57-ophub \
+          make -j2 ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            KSRC="$HDR" KVER=6.18.57-ophub \
             2>&1 | tee "$RUNNER_TEMP/driver-build.log"
+
+          echo "===== BUILT MODULES ====="
+          find "$DRIVER" -type f -name '*.ko' -print
 
           MODULE="$(find "$DRIVER" -type f \
             -name 8189fs.ko -print -quit)"
           test -n "$MODULE"
-          test -s "$MODULE"
 
           mkdir -p "$GITHUB_WORKSPACE/output"
           cp "$MODULE" "$GITHUB_WORKSPACE/output/8189fs.ko"
 
+          echo "===== MODULE CHECKSUM AND FORMAT ====="
           sha256sum "$GITHUB_WORKSPACE/output/8189fs.ko"
           file "$GITHUB_WORKSPACE/output/8189fs.ko"
 
-      - name: Upload compiler log
-        if: always()
+      - name: Save compiler error log
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.audit_only != true) }}
         uses: actions/upload-artifact@v4
         with:
           name: alternative-driver-build-log
           path: ${{ runner.temp }}/driver-build.log
           if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload module artifact
-        if: success()
+        if: ${{ success() && (github.event_name != 'workflow_dispatch' || inputs.audit_only != true) }}
         uses: actions/upload-artifact@v4
         with:
           name: rtl8189fs-armbian-openwrt-6.18.57
