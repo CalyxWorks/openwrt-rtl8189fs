@@ -100,38 +100,36 @@ jobs:
             '\(\*(add_key|get_key|del_key|set_default_mgmt_key|get_station|add_station|del_station|change_station|dump_station|remain_on_channel|mgmt_tx)\)' \
             "$HDR/include/net/cfg80211.h" || true
 
+
       - name: Rebuild host tools natively
         shell: bash
         run: |
           set -euxo pipefail
-
-          # The archived tools were built for ARM64. GitHub's
-          # runner is x86-64, so rebuild host executables.
           cd "$HDR"
 
+          # Supply the matching kernel configuration.
+          cp "$GITHUB_WORKSPACE/kernel-6.18.57.config" .config
+
+          # Explicitly select the target architecture. Without this,
+          # Kbuild defaults to x86 and looks for arch/x86/Makefile.
+          make ARCH=arm64 olddefconfig
+
+          # Rebuild host executables for the GitHub runner.
           rm -f scripts/mod/modpost
-          rm -f scripts/mod/modpost.o
-          rm -f scripts/mod/file2alias.o
-          rm -f scripts/mod/sumversion.o
-          rm -f scripts/mod/symsearch.o
+          rm -f scripts/basic/fixdep
 
-          make -j2 scripts/mod/modpost HOSTCC=gcc HOSTLD=gcc
+          make ARCH=arm64 -j2 \
+            HOSTCC=gcc HOSTLD=gcc \
+            scripts/mod/modpost scripts/basic/fixdep
 
+          echo "=== modpost architecture ==="
           file scripts/mod/modpost
           readelf -h scripts/mod/modpost | grep -E 'Class:|Machine:'
-          scripts/mod/modpost --help || true
 
-          # Build fixdep from source for the runner architecture.
-          gcc -O2 -Wall -Wextra \
-            -I scripts/include \
-            -o "$RUNNER_TEMP/fixdep-native" \
-            scripts/basic/fixdep.c
+          echo "=== fixdep architecture ==="
+          file scripts/basic/fixdep
+          readelf -h scripts/basic/fixdep | grep -E 'Class:|Machine:'
 
-          file "$RUNNER_TEMP/fixdep-native"
-          readelf -h "$RUNNER_TEMP/fixdep-native" |
-            grep -E 'Class:|Machine:'
-
-          cp "$RUNNER_TEMP/fixdep-native" scripts/basic/fixdep
 
       - name: Fetch driver source and record identity
         shell: bash
