@@ -8,8 +8,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
 
     env:
       CROSS_COMPILE: aarch64-none-linux-gnu-
@@ -26,7 +26,7 @@ jobs:
           sudo apt-get install -y \
             build-essential bc bison flex \
             libssl-dev libelf-dev dwarves \
-            xz-utils curl tar
+            xz-utils curl tar kmod
 
       - name: Download ARM GNU cross-compiler
         shell: bash
@@ -42,7 +42,7 @@ jobs:
           echo "$RUNNER_TEMP/toolchain/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-gcc" --version
 
-      - name: Extract kernel headers into a clean directory
+      - name: Extract kernel headers
         shell: bash
         run: |
           set -euxo pipefail
@@ -52,28 +52,23 @@ jobs:
           test -f "$ARCHIVE"
           rm -rf "$HDR"
           mkdir -p "$HDR"
-
           tar -xzf "$ARCHIVE" -C "$HDR"
 
           test -f "$HDR/Makefile"
           test -f "$HDR/Module.symvers"
           test -f "$HDR/include/generated/autoconf.h"
 
-          echo "=== Header tree ==="
-          ls -ld "$HDR"
-          ls -l "$HDR/scripts/mod" || true
-
       - name: Prepare kernel build utilities
         shell: bash
         run: |
           set -euxo pipefail
           HDR="$RUNNER_TEMP/headers"
-          export ARCH=arm64
-          export CROSS_COMPILE="$CROSS_COMPILE"
 
           if [ ! -x "$HDR/scripts/mod/modpost" ]; then
             make -C "$HDR" \
-              ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" scripts
+              ARCH=arm64 \
+              CROSS_COMPILE="$CROSS_COMPILE" \
+              scripts
           fi
 
           test -x "$HDR/scripts/mod/modpost"
@@ -83,7 +78,6 @@ jobs:
         run: |
           set -euxo pipefail
           DRIVER="$RUNNER_TEMP/driver/rtl8189fs-armbian"
-          rm -rf "$DRIVER"
           mkdir -p "$DRIVER"
 
           curl -fL \
@@ -110,4 +104,30 @@ jobs:
           HDR="$RUNNER_TEMP/headers"
           DRIVER="$RUNNER_TEMP/driver/rtl8189fs-armbian"
 
-          export ARCH
+          make -C "$HDR" \
+            M="$DRIVER" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            KVER=6.18.57-ophub \
+            modules
+
+          test -s "$DRIVER/8189fs.ko"
+
+          mkdir -p "$RUNNER_TEMP/driver-artifact"
+          cp "$DRIVER/8189fs.ko" \
+            "$RUNNER_TEMP/driver-artifact/"
+
+          modinfo "$DRIVER/8189fs.ko" \
+            > "$RUNNER_TEMP/driver-artifact/module-info.txt"
+
+          "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-nm" \
+            -u "$DRIVER/8189fs.ko" \
+            > "$RUNNER_TEMP/driver-artifact/undefined-symbols.txt"
+
+      - name: Upload build results and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtl8189fs-armbian-6.18.57-results
+          path: ${{ runner.temp }}/driver-artifact/
+          if-no-files-found: error
