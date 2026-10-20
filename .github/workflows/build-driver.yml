@@ -327,13 +327,50 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # Do not rebuild modpost or conf. Rebuild only fixdep for the
-          # runner's native architecture if the archive's copy cannot run.
-          if ! "$HDR/scripts/basic/fixdep" --help >/dev/null 2>&1; then
-            echo "The archived fixdep is not runnable on this host."
-            echo "STOP: use the previously validated native fixdep recipe for this header archive."
+
+          FIXDEP_DIR="$HDR/scripts/basic"
+          FIXDEP_SRC="$FIXDEP_DIR/fixdep.c"
+          FIXDEP_BIN="$FIXDEP_DIR/fixdep"
+          FIXDEP_BACKUP="$FIXDEP_DIR/fixdep.arm64-backup"
+          FIXDEP_NATIVE="$RUNNER_TEMP/fixdep-native"
+
+          test -s "$FIXDEP_SRC"
+          test -s "$HDR/scripts/include/xalloc.h"
+
+          echo "=== Compile fixdep for the GitHub Actions host ==="
+          gcc -O2 -Wall -Wextra \
+            -I"$HDR/scripts/include" \
+            -o "$FIXDEP_NATIVE" \
+            "$FIXDEP_SRC"
+
+          echo "=== Verify native executable architecture ==="
+          file "$FIXDEP_NATIVE"
+          readelf -h "$FIXDEP_NATIVE" | grep -E 'Class:|Machine:'
+
+          echo "=== Verify executable runs ==="
+          set +e
+          "$FIXDEP_NATIVE" >"$RUNNER_TEMP/fixdep-test.log" 2>&1
+          FIXDEP_STATUS=$?
+          set -e
+          cat "$RUNNER_TEMP/fixdep-test.log"
+
+          # fixdep invoked without arguments should print usage and exit nonzero.
+          if [ "$FIXDEP_STATUS" -eq 0 ]; then
+            echo "STOP: unexpected fixdep test result."
             exit 1
           fi
+
+          # Preserve the archived executable before replacing it.
+          if [ ! -e "$FIXDEP_BACKUP" ]; then
+            cp -p "$FIXDEP_BIN" "$FIXDEP_BACKUP"
+          fi
+
+          install -m 755 "$FIXDEP_NATIVE" "$FIXDEP_BIN"
+
+          echo "=== Verify installed fixdep ==="
+          file "$FIXDEP_BIN"
+          "$FIXDEP_BIN" >"$RUNNER_TEMP/fixdep-installed-test.log" 2>&1 || true
+          cat "$RUNNER_TEMP/fixdep-installed-test.log"
 
       - name: Build module
         if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.audit_only) }}
