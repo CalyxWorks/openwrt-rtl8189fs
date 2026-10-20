@@ -316,12 +316,6 @@ jobs:
           sed -n '7100,7550p' "$DRIVER/os_dep/linux/ioctl_cfg80211.c" |
             grep -n -E '\*cookie|mgmt_tx_cookie|cfg80211_rtw_mgmt_tx' || true
 
-      - name: Stop after audit when requested
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.audit_only }}
-        run: |
-          echo "Audit-only run complete. No module was compiled or uploaded."
-          echo "Review the API audit and compatibility-edit output before a build run."
-
       - name: Prepare native fixdep
         if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.audit_only) }}
         shell: bash
@@ -372,26 +366,65 @@ jobs:
           "$FIXDEP_BIN" >"$RUNNER_TEMP/fixdep-installed-test.log" 2>&1 || true
           cat "$RUNNER_TEMP/fixdep-installed-test.log"
 
-      - name: Inspect exact callback bodies
+      - name: Extract complete cfg80211 functions
         shell: bash
         run: |
           set -eu
-          FILE="$DRIVER/os_dep/linux/ioctl_cfg80211.c"
+          python3 - "$DRIVER/os_dep/linux/ioctl_cfg80211.c" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
 
-          echo "===== ADD KEY ====="
-          sed -n '1650,1810p' "$FILE"
+          path = Path(sys.argv[1])
+          text = path.read_text()
 
-          echo "===== GET KEY ====="
-          sed -n '1795,1985p' "$FILE"
+          names = [
+              "cfg80211_rtw_add_key",
+              "cfg80211_rtw_get_key",
+              "cfg80211_rtw_del_key",
+              "cfg80211_rtw_set_default_mgmt_key",
+              "rtw_cfg80211_indicate_sta_assoc",
+              "rtw_cfg80211_indicate_sta_disassoc",
+          ]
 
-          echo "===== DELETE KEY ====="
-          sed -n '1960,2065p' "$FILE"
+          for name in names:
+              pattern = re.compile(
+                  r"(?m)^[ \t]*(?:(?:static|inline)\s+)*"
+                  r"[\w\s\*]+\b" + re.escape(name) + r"\s*\("
+              )
+              matches = list(pattern.finditer(text))
+              if len(matches) != 1:
+                  print(
+                      f"\n===== {name}: expected one definition, "
+                      f"found {len(matches)} ====="
+                  )
+                  for match in matches:
+                      print(f"line {text.count(chr(10), 0, match.start()) + 1}")
+                  raise SystemExit(1)
 
-          echo "===== DEFAULT MANAGEMENT KEY ====="
-          sed -n '2035,2105p' "$FILE"
+              start = matches[0].start()
+              opening = text.find("{", matches[0].end())
+              if opening < 0:
+                  raise SystemExit(f"Could not find body of {name}")
 
-          echo "===== STATION ASSOCIATION / DISASSOCIATION ====="
-          sed -n '4255,4345p' "$FILE"
+              depth = 0
+              closing = None
+              for i in range(opening, len(text)):
+                  if text[i] == "{":
+                      depth += 1
+                  elif text[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          closing = i + 1
+                          break
+
+              if closing is None:
+                  raise SystemExit(f"Unclosed function body: {name}")
+
+              first_line = text.count("\n", 0, start) + 1
+              print(f"\n===== {name} (starts at line {first_line}) =====")
+              print(text[start:closing])
+          PY
 
       - name: Build module
         if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.audit_only) }}
