@@ -188,6 +188,12 @@ jobs:
             'cfg80211_rtw_(remain_on_channel|cancel_remain_on_channel|mgmt_tx)\(' \
             "$FILE" || true
 
+          echo "===== POWER-SAVING SYMBOLS IN SOURCE ====="
+          grep -RniE \
+            'CONFIG_POWER_SAVING|CONFIG_IPS_MODE|RTW_IPS_MODE|IPS_MODE|power.?saving' \
+            "$SRC" --include='Makefile' --include='*.mk' --include='*.h' \
+            --include='*.c' | head -n 100 || true
+
           echo "===== CFG80211 OPS INITIALIZER ====="
           grep -n -B 12 -A 90 -E \
             'static const struct cfg80211_ops|struct cfg80211_ops' \
