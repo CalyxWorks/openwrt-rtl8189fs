@@ -1,0 +1,112 @@
+name: Build Alternative RTL8189FS Driver
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      HDR: ${{ runner.temp }}/headers
+      DRIVER: ${{ runner.temp }}/driver/rtl8189fs-armbian
+      CROSS_COMPILE: aarch64-none-linux-gnu-
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex \
+            libssl-dev libelf-dev dwarves xz-utils curl tar
+
+      - name: Download ARM GNU cross-compiler
+        run: |
+          set -euxo pipefail
+          URL="https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/15.3.rel1/arm-gnu-toolchain-15.3.rel1-x86_64-aarch64-none-linux-gnu.tar.xz"
+          curl -fL "$URL" -o "$RUNNER_TEMP/arm-toolchain.tar.xz"
+          mkdir -p "$RUNNER_TEMP/toolchain"
+          tar -xJf "$RUNNER_TEMP/arm-toolchain.tar.xz" \
+            -C "$RUNNER_TEMP/toolchain" --strip-components=1
+          echo "$RUNNER_TEMP/toolchain/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-gcc" --version
+
+      - name: Download kernel headers artifact
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HDR"
+          tar -xzf header-6.18.57-ophub.tar.gz \
+            -C "$HDR" --strip-components=1
+
+          test -f "$HDR/Makefile"
+          test -f "$HDR/Module.symvers"
+          test -f "$HDR/include/generated/autoconf.h"
+
+      - name: Prepare kernel build utilities
+        run: |
+          set -euxo pipefail
+          export ARCH=arm64
+          export CROSS_COMPILE="$CROSS_COMPILE"
+
+          make -C "$HDR" \
+            ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            scripts
+
+          test -x "$HDR/scripts/mod/modpost"
+
+      - name: Download alternative RTL8189FS source
+        run: |
+          set -euxo pipefail
+          mkdir -p "$DRIVER"
+
+          curl -fL \
+            https://github.com/gustiarto/rtl8189fs-armbian/archive/refs/heads/main.tar.gz \
+            -o "$RUNNER_TEMP/rtl8189fs-armbian.tar.gz"
+
+          tar -xzf "$RUNNER_TEMP/rtl8189fs-armbian.tar.gz" \
+            --strip-components=1 -C "$DRIVER"
+
+          sed -i \
+            's/^CONFIG_IPS_MODE[[:space:]]*=.*/CONFIG_IPS_MODE = 0/' \
+            "$DRIVER/Makefile"
+
+          grep -n -E 'CONFIG_POWER_SAVING|CONFIG_IPS_MODE' \
+            "$DRIVER/Makefile"
+
+      - name: Build alternative driver
+        run: |
+          set -euxo pipefail
+          export ARCH=arm64
+          export CROSS_COMPILE="$CROSS_COMPILE"
+
+          make -C "$HDR" \
+            M="$DRIVER" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            KVER=6.18.57-ophub \
+            modules
+
+          test -s "$DRIVER/8189fs.ko"
+          "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-readelf" \
+            -h "$DRIVER/8189fs.ko"
+          "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-nm" \
+            -u "$DRIVER/8189fs.ko" \
+            > "$RUNNER_TEMP/undefined-symbols.txt"
+
+      - name: Upload build results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtl8189fs-armbian-6.18.57-results
+          path: |
+            ${{ runner.temp }}/driver/rtl8189fs-armbian/8189fs.ko
+            ${{ runner.temp }}/driver/rtl8189fs-armbian/Module.symvers
+            ${{ runner.temp }}/undefined-symbols.txt
+          if-no-files-found: warn
