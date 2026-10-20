@@ -372,32 +372,26 @@ jobs:
           "$FIXDEP_BIN" >"$RUNNER_TEMP/fixdep-installed-test.log" 2>&1 || true
           cat "$RUNNER_TEMP/fixdep-installed-test.log"
 
-      - name: Audit remaining cfg80211 callbacks
+      - name: Inspect exact callback bodies
         shell: bash
         run: |
-          set -euxo pipefail
+          set -eu
           FILE="$DRIVER/os_dep/linux/ioctl_cfg80211.c"
 
-          echo "===== KEY CALLBACK DEFINITIONS ====="
-          grep -n -A 65 -E \
-            'cfg80211_rtw_(add_key|get_key|del_key|set_default_mgmt_key)\(' \
-            "$FILE"
+          echo "===== ADD KEY ====="
+          sed -n '1650,1810p' "$FILE"
 
-          echo "===== STATION NOTIFICATION FUNCTIONS ====="
-          sed -n '4250,4350p' "$FILE"
+          echo "===== GET KEY ====="
+          sed -n '1795,1985p' "$FILE"
 
-          echo "===== KEY CALLBACK REGISTRATION ====="
-          sed -n '9655,9690p' "$FILE"
+          echo "===== DELETE KEY ====="
+          sed -n '1960,2065p' "$FILE"
 
-          echo "===== WIRELESS DEVICE CONVERSION HELPERS ====="
-          grep -R -n -E \
-            'wdev_to_ndev|ndev_to_wdev' \
-            "$DRIVER/include" "$FILE" | head -n 100
+          echo "===== DEFAULT MANAGEMENT KEY ====="
+          sed -n '2035,2105p' "$FILE"
 
-          echo "===== KERNEL NOTIFICATION PROTOTYPES ====="
-          grep -n -A 4 -B 2 -E \
-            'cfg80211_(new_sta|del_sta)\(' \
-            "$HDR/include/net/cfg80211.h"
+          echo "===== STATION ASSOCIATION / DISASSOCIATION ====="
+          sed -n '4255,4345p' "$FILE"
 
       - name: Build module
         if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.audit_only) }}
