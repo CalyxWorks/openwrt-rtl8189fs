@@ -111,6 +111,20 @@ jobs:
 
           file "$HDR/scripts/basic/fixdep"
           file "$HDR/scripts/mod/modpost"
+
+      - name: Print affected driver callbacks
+        shell: bash
+        run: |
+          sed -n \
+            -e '2225,2260p' \
+            -e '5290,5330p' \
+            -e '5465,5505p' \
+            -e '5580,5620p' \
+            -e '5740,5790p' \
+            -e '6640,6690p' \
+            -e '7235,7285p' \
+            -e '9770,9885p' \
+            "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
           
       - name: Build kernel module
         shell: bash
