@@ -1,14 +1,8 @@
-# Build RTL8189FS for OpenWrt 6.18.57
+
 name: Build RTL8189FS for OpenWrt 6.18.57
 
 on:
   workflow_dispatch:
-    inputs:
-      audit_only:
-        description: "Audit source and kernel headers without compiling"
-        required: true
-        type: boolean
-        default: true
   push:
     paths:
       - ".github/workflows/build-driver.yml"
@@ -23,36 +17,46 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
+    env:
+      KERNEL_RELEASE: 6.18.57-ophub
+      DRIVER_REPO: https://github.com/gustiarto/rtl8189fs-armbian.git
+      DRIVER_REF: main
+
     steps:
-      - name: Check out workflow inputs
+      - name: Check out build inputs
         uses: actions/checkout@v4
 
       - name: Install build dependencies
         run: |
-          set -eux
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             build-essential bc bison flex \
             libssl-dev libelf-dev dwarves \
-            xz-utils zstd curl python3
+            xz-utils zstd curl git python3 \
+            file binutils
 
       - name: Install ARM GNU Toolchain
         run: |
-          set -eux
+          set -euxo pipefail
           URL="https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/15.3.rel1/arm-gnu-toolchain-15.3.rel1-x86_64-aarch64-none-linux-gnu.tar.xz"
-          curl --fail --location --retry 3 "$URL" -o /tmp/arm-toolchain.tar.xz
+          curl --fail --location --retry 3 "$URL" \
+            -o "$RUNNER_TEMP/arm-toolchain.tar.xz"
+
           sudo mkdir -p /opt/arm-toolchain
-          sudo tar -xJf /tmp/arm-toolchain.tar.xz \
+          sudo tar -xJf "$RUNNER_TEMP/arm-toolchain.tar.xz" \
             --strip-components=1 -C /opt/arm-toolchain
+
           echo "/opt/arm-toolchain/bin" >> "$GITHUB_PATH"
           /opt/arm-toolchain/bin/aarch64-none-linux-gnu-gcc --version
 
-      - name: Verify required repository inputs
+      - name: Validate repository inputs
         run: |
-          set -eux
+          set -euxo pipefail
           test -s header-6.18.57-ophub.tar.gz
           test -s kernel-6.18.57.config
-          sha256sum header-6.18.57-ophub.tar.gz kernel-6.18.57.config
+          sha256sum header-6.18.57-ophub.tar.gz \
+            kernel-6.18.57.config
 
       - name: Extract and validate kernel headers
         shell: bash
@@ -66,420 +70,329 @@ jobs:
             -type f -name Module.symvers -print -quit)"
           test -n "$SYMVERS"
           HDR="$(dirname "$SYMVERS")"
-          echo "HDR=$HDR" >> "$GITHUB_ENV"
 
+          echo "HDR=$HDR" >> "$GITHUB_ENV"
           test -s "$HDR/Makefile"
           test -s "$HDR/include/config/auto.conf"
           test -s "$HDR/include/generated/utsrelease.h"
-          test -s "$HDR/scripts/mod/modpost"
+          test -s "$HDR/scripts/mod/modpost.c"
+          test -s "$HDR/scripts/mod/Makefile"
           test -s "$HDR/scripts/basic/fixdep.c"
 
-          echo "=== Kernel release ==="
-          cat "$HDR/include/generated/utsrelease.h"
-          echo "=== Kernel version code ==="
-          grep -n 'LINUX_VERSION_CODE' \
-            "$HDR/include/generated/uapi/linux/version.h" \
-            "$HDR/include/linux/version.h" 2>/dev/null || true
-          echo "=== Header directory ==="
-          echo "$HDR"
+          RELEASE="$(sed -n \
+            's/^#define UTS_RELEASE "\(.*\)"/\1/p' \
+            "$HDR/include/generated/utsrelease.h")"
+
+          echo "Header release: $RELEASE"
+          test "$RELEASE" = "$KERNEL_RELEASE"
 
           echo "=== Module.symvers ==="
           wc -l "$HDR/Module.symvers"
           sha256sum "$HDR/Module.symvers"
-          
-          echo "=== Kernel configuration ==="
-          grep -E '^(CONFIG_MODVERSIONS|CONFIG_CFG80211|CONFIG_MAC80211)=' \
-            "$HDR/.config" 2>/dev/null || true
-          
-          echo "=== Generated configuration ==="
-          grep -E '^(CONFIG_MODVERSIONS|CONFIG_CFG80211|CONFIG_MAC80211)=' \
-            "$HDR/include/config/auto.conf" 2>/dev/null || true
-          
-          echo "=== Header archive checksum ==="
-          sha256sum header-6.18.57-ophub.tar.gz
 
-      - name: Download pinned upstream RTL8189FS source
-        run: |
-          set -eux
-          URL="https://github.com/jwrdegoede/rtl8189ES_linux/archive/876e627a5b6a8021700391b4249a4a31edfebe5c.tar.gz"
-          curl --fail --location --retry 3 "$URL" \
-            -o "$RUNNER_TEMP/rtl8189fs-source.tar.gz"
-          mkdir -p "$RUNNER_TEMP/driver"
-          tar -xzf "$RUNNER_TEMP/rtl8189fs-source.tar.gz" \
-            --strip-components=1 -C "$RUNNER_TEMP/driver"
-          echo "DRIVER=$RUNNER_TEMP/driver" >> "$GITHUB_ENV"
+          echo "=== Relevant configuration ==="
+          grep -E \
+            '^(CONFIG_MODULES|CONFIG_MODVERSIONS|CONFIG_CFG80211|CONFIG_MAC80211)=' \
+            "$HDR/include/config/auto.conf" || true
 
-      - name: Audit kernel callback API
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "=== Kernel station callback declarations ==="
-          grep -n -A 8 -B 2 -E \
-            '(\*add_station|\*del_station|\*change_station|\*get_station|\*dump_station)' \
-            "$HDR/include/net/cfg80211.h"
+          echo "=== Callback declarations ==="
+          grep -n -A 9 -B 2 -E \
+            '\(\*(add_key|get_key|del_key|set_default_mgmt_key|get_station|add_station|del_station|change_station|dump_station|remain_on_channel|mgmt_tx)\)' \
+            "$HDR/include/net/cfg80211.h" || true
 
-          echo "=== Kernel remain-on-channel declaration ==="
-          grep -n -A 8 -B 2 '(\*remain_on_channel)' \
-            "$HDR/include/net/cfg80211.h"
-
-          echo "=== Kernel management-transmit declaration ==="
-          grep -n -A 8 -B 2 '(\*mgmt_tx)' \
-            "$HDR/include/net/cfg80211.h"
-
-          echo "=== Driver callback definitions ==="
-          grep -n -A 12 -E \
-            'cfg80211_rtw_(add_station|del_station|change_station|get_station|dump_station|remain_on_channel|mgmt_tx)\(' \
-            "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
-
-          echo "=== Power-saving build settings ==="
-          grep -n -E 'CONFIG_POWER_SAVING|CONFIG_IPS_MODE|CONFIG_LPS_MODE' \
-            "$DRIVER/Makefile"
-
-      - name: Apply checked compatibility changes
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python3 - "$DRIVER/os_dep/linux/ioctl_cfg80211.c" <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          path = pathlib.Path(sys.argv[1])
-          source = path.read_text()
-
-          def locate_function(text, name):
-              pattern = re.compile(
-                  r'\bstatic\s+(?:int|s32)\s+' +
-                  re.escape(name) + r'\s*\('
-              )
-              matches = list(pattern.finditer(text))
-              if len(matches) != 1:
-                  raise SystemExit(
-                      f"STOP: expected one definition of {name}; "
-                      f"found {len(matches)}"
-                  )
-
-              start = matches[0].start()
-              opening = text.find('(', matches[0].start())
-              depth = 0
-              closing = None
-
-              for i in range(opening, len(text)):
-                  if text[i] == '(':
-                      depth += 1
-                  elif text[i] == ')':
-                      depth -= 1
-                      if depth == 0:
-                          closing = i
-                          break
-
-              if closing is None:
-                  raise SystemExit(f"STOP: cannot parse {name} signature")
-
-              body_open = text.find('{', closing)
-              if body_open < 0:
-                  raise SystemExit(f"STOP: cannot find {name} body")
-
-              depth = 0
-              body_close = None
-              for i in range(body_open, len(text)):
-                  if text[i] == '{':
-                      depth += 1
-                  elif text[i] == '}':
-                      depth -= 1
-                      if depth == 0:
-                          body_close = i
-                          break
-
-              if body_close is None:
-                  raise SystemExit(f"STOP: cannot parse {name} body")
-
-              return start, closing, body_open, body_close
-
-          def edit_function(name, transform):
-              global source
-              start, closing, body_open, body_close = locate_function(
-                  source, name
-              )
-              old = source[start:body_close + 1]
-              new = transform(old, body_open - start, body_close - start)
-              if new == old:
-                  print(f"Already matches expected patch: {name}")
-              else:
-                  source = source[:start] + new + source[body_close + 1:]
-                  print(f"Patched: {name}")
-
-          def patch_station(name):
-              def transform(fn, body_open, body_close):
-                  signature = fn[:fn.find('{')]
-                  body = fn[len(signature):]
-
-                  if 'struct wireless_dev *wdev' not in signature:
-                      if 'struct net_device *ndev' not in signature:
-                          raise SystemExit(
-                              f"STOP: unexpected signature for {name}"
-                          )
-                      signature = signature.replace(
-                          'struct net_device *ndev',
-                          'struct wireless_dev *wdev',
-                          1
-                      )
-
-                  if 'struct net_device *ndev' not in body:
-                      body = body.replace(
-                          '{',
-                          '{\n\tstruct net_device *ndev = wdev_to_ndev(wdev);\n',
-                          1
-                      )
-
-                  return signature + body
-
-              edit_function(name, transform)
-
-          for callback in (
-              'cfg80211_rtw_add_station',
-              'cfg80211_rtw_del_station',
-              'cfg80211_rtw_change_station',
-              'cfg80211_rtw_dump_station',
-              'cfg80211_rtw_get_station',
-          ):
-              patch_station(callback)
-
-          def patch_roc(fn, body_open, body_close):
-              signature = fn[:fn.find('{')]
-              body = fn[len(signature):]
-
-              if 'u64 *cookie' in signature:
-                  signature = signature.replace(
-                      'u64 *cookie', 'u64 cookie', 1
-                  )
-              elif not re.search(r'\bu64\s+cookie\b', signature):
-                  raise SystemExit(
-                      "STOP: unexpected remain_on_channel cookie signature"
-                  )
-
-              if 'const u8 *rx_addr' not in signature:
-                  if 'u64 cookie' not in signature:
-                      raise SystemExit("STOP: cannot place rx_addr parameter")
-                  signature = signature.replace(
-                      'u64 cookie',
-                      'u64 cookie, const u8 *rx_addr',
-                      1
-                  )
-
-              body, count = re.subn(
-                  r'\*cookie\s*=\s*ATOMIC_INC_RETURN\s*\([^;]*\)\s*;',
-                  '/* Cookie is supplied by cfg80211. */',
-                  body,
-                  count=1
-              )
-              if count == 0 and 'ATOMIC_INC_RETURN' in body:
-                  raise SystemExit(
-                      "STOP: ROC cookie-generation statement did not match"
-                  )
-
-              body = re.sub(r'\*cookie\b', 'cookie', body)
-              if '(void)rx_addr;' not in body:
-                  body = body.replace(
-                      '{', '{\n\t(void)rx_addr;\n', 1
-                  )
-
-              return signature + body
-
-          edit_function('cfg80211_rtw_remain_on_channel', patch_roc)
-
-          def patch_mgmt_tx(fn, body_open, body_close):
-              signature = fn[:fn.find('{')]
-              body = fn[len(signature):]
-
-              if 'struct cfg80211_mgmt_tx_params *params' not in signature:
-                  raise SystemExit("STOP: unexpected mgmt_tx params signature")
-
-              if 'u64 *cookie' in signature:
-                  signature = signature.replace(
-                      'u64 *cookie', 'u64 cookie', 1
-                  )
-              elif not re.search(r'\bu64\s+cookie\b', signature):
-                  raise SystemExit("STOP: unexpected mgmt_tx cookie signature")
-
-              body, count = re.subn(
-                  r'\*cookie\s*=\s*pwdev_priv->mgmt_tx_cookie\+\+\s*;',
-                  '/* Cookie is supplied by cfg80211. */',
-                  body,
-                  count=1
-              )
-              if count == 0 and 'mgmt_tx_cookie++' in body:
-                  raise SystemExit("STOP: mgmt_tx cookie assignment did not match")
-
-              body = re.sub(r'\*cookie\b', 'cookie', body)
-              return signature + body
-
-          edit_function('cfg80211_rtw_mgmt_tx', patch_mgmt_tx)
-
-          path.write_text(source)
-          print("Compatibility patch completed.")
-          PY
-
-          echo "=== Confirm callback signatures ==="
-          grep -n -A 12 -E \
-            'static (int|s32)[[:space:]]+cfg80211_rtw_(get_station|add_station|del_station|change_station|dump_station|remain_on_channel|mgmt_tx)\(' \
-            "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
-
-          echo "=== Confirm no pointer-cookie operations remain in these callbacks ==="
-          sed -n '6500,6750p' "$DRIVER/os_dep/linux/ioctl_cfg80211.c" |
-            grep -n -E '\*cookie|remain_on_channel|rx_addr' || true
-          sed -n '7100,7550p' "$DRIVER/os_dep/linux/ioctl_cfg80211.c" |
-            grep -n -E '\*cookie|mgmt_tx_cookie|cfg80211_rtw_mgmt_tx' || true
-
-      - name: Prepare native fixdep
-        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.audit_only) }}
+      - name: Rebuild host tools natively
         shell: bash
         run: |
           set -euxo pipefail
 
-          FIXDEP_DIR="$HDR/scripts/basic"
-          FIXDEP_SRC="$FIXDEP_DIR/fixdep.c"
-          FIXDEP_BIN="$FIXDEP_DIR/fixdep"
-          FIXDEP_BACKUP="$FIXDEP_DIR/fixdep.arm64-backup"
-          FIXDEP_NATIVE="$RUNNER_TEMP/fixdep-native"
+          # The archived tools were built for ARM64. GitHub's
+          # runner is x86-64, so rebuild host executables.
+          cd "$HDR"
 
-          test -s "$FIXDEP_SRC"
-          test -s "$HDR/scripts/include/xalloc.h"
+          rm -f scripts/mod/modpost
+          rm -f scripts/mod/modpost.o
+          rm -f scripts/mod/file2alias.o
+          rm -f scripts/mod/sumversion.o
+          rm -f scripts/mod/symsearch.o
 
-          echo "=== Compile fixdep for the GitHub Actions host ==="
+          make -j2 scripts/mod/modpost HOSTCC=gcc HOSTLD=gcc
+
+          file scripts/mod/modpost
+          readelf -h scripts/mod/modpost | grep -E 'Class:|Machine:'
+          scripts/mod/modpost --help || true
+
+          # Build fixdep from source for the runner architecture.
           gcc -O2 -Wall -Wextra \
-            -I"$HDR/scripts/include" \
-            -o "$FIXDEP_NATIVE" \
-            "$FIXDEP_SRC"
+            -I scripts/include \
+            -o "$RUNNER_TEMP/fixdep-native" \
+            scripts/basic/fixdep.c
 
-          echo "=== Verify native executable architecture ==="
-          file "$FIXDEP_NATIVE"
-          readelf -h "$FIXDEP_NATIVE" | grep -E 'Class:|Machine:'
+          file "$RUNNER_TEMP/fixdep-native"
+          readelf -h "$RUNNER_TEMP/fixdep-native" |
+            grep -E 'Class:|Machine:'
 
-          echo "=== Verify executable runs ==="
-          set +e
-          "$FIXDEP_NATIVE" >"$RUNNER_TEMP/fixdep-test.log" 2>&1
-          FIXDEP_STATUS=$?
-          set -e
-          cat "$RUNNER_TEMP/fixdep-test.log"
+          cp "$RUNNER_TEMP/fixdep-native" scripts/basic/fixdep
 
-          # fixdep invoked without arguments should print usage and exit nonzero.
-          if [ "$FIXDEP_STATUS" -eq 0 ]; then
-            echo "STOP: unexpected fixdep test result."
-            exit 1
-          fi
-
-          # Preserve the archived executable before replacing it.
-          if [ ! -e "$FIXDEP_BACKUP" ]; then
-            cp -p "$FIXDEP_BIN" "$FIXDEP_BACKUP"
-          fi
-
-          install -m 755 "$FIXDEP_NATIVE" "$FIXDEP_BIN"
-
-          echo "=== Verify installed fixdep ==="
-          file "$FIXDEP_BIN"
-          "$FIXDEP_BIN" >"$RUNNER_TEMP/fixdep-installed-test.log" 2>&1 || true
-          cat "$RUNNER_TEMP/fixdep-installed-test.log"
-
-      - name: Extract complete cfg80211 functions
+      - name: Fetch driver source and record identity
         shell: bash
         run: |
-          set -eu
+          set -euxo pipefail
+
+          git clone --depth 1 --branch "$DRIVER_REF" \
+            "$DRIVER_REPO" "$RUNNER_TEMP/driver"
+
+          DRIVER="$RUNNER_TEMP/driver"
+          echo "DRIVER=$DRIVER" >> "$GITHUB_ENV"
+
+          git -C "$DRIVER" rev-parse HEAD |
+            tee "$RUNNER_TEMP/source-commit.txt"
+
+          test -s "$DRIVER/Makefile"
+          test -s "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
+
+          mkdir -p output
+          cp "$RUNNER_TEMP/source-commit.txt" output/
+
+      - name: Apply verified kernel compatibility changes
+        shell: bash
+        run: |
+          set -euxo pipefail
+
           python3 - "$DRIVER/os_dep/linux/ioctl_cfg80211.c" <<'PY'
-          import re
-          import sys
           from pathlib import Path
+          import sys
 
           path = Path(sys.argv[1])
           text = path.read_text()
 
-          names = [
+          # The scan-tested tree moved these branches from 7.1
+          # to 6.18. Apply only if the expected old marker exists.
+          old = "KERNEL_VERSION(7, 1, 0)"
+          new = "KERNEL_VERSION(6, 18, 0)"
+
+          if old in text:
+              text = text.replace(old, new)
+              print("Updated 7.1 callback thresholds to 6.18.")
+          elif new in text:
+              print("6.18 callback thresholds already present.")
+          else:
+              raise SystemExit(
+                  "STOP: expected callback version markers not found"
+              )
+
+          # Require exactly one definition for each changed callback.
+          for name in (
               "cfg80211_rtw_add_key",
               "cfg80211_rtw_get_key",
               "cfg80211_rtw_del_key",
               "cfg80211_rtw_set_default_mgmt_key",
-              "rtw_cfg80211_indicate_sta_assoc",
-              "rtw_cfg80211_indicate_sta_disassoc",
-          ]
-
-          for name in names:
-              pattern = re.compile(
-                  r"(?m)^[ \t]*(?:(?:static|inline)\s+)*"
-                  r"[\w\s\*]+\b" + re.escape(name) + r"\s*\("
-              )
-              matches = list(pattern.finditer(text))
-              if len(matches) != 1:
-                  print(
-                      f"\n===== {name}: expected one definition, "
-                      f"found {len(matches)} ====="
+              "cfg80211_rtw_get_station",
+              "cfg80211_rtw_add_station",
+              "cfg80211_rtw_del_station",
+              "cfg80211_rtw_change_station",
+              "cfg80211_rtw_dump_station",
+              "cfg80211_rtw_remain_on_channel",
+              "cfg80211_rtw_mgmt_tx",
+          ):
+              count = text.count(name + "(")
+              if count == 0:
+                  raise SystemExit(
+                      f"STOP: callback not found: {name}"
                   )
-                  for match in matches:
-                      print(f"line {text.count(chr(10), 0, match.start()) + 1}")
-                  raise SystemExit(1)
 
-              start = matches[0].start()
-              opening = text.find("{", matches[0].end())
-              if opening < 0:
-                  raise SystemExit(f"Could not find body of {name}")
-
+          # Adapt cookie signatures and uses only within the two
+          # callback function bodies. Refuse unexpected source.
+          def function_bounds(source, name):
+              marker = name + "("
+              pos = source.find(marker)
+              if pos < 0:
+                  raise SystemExit(f"Missing {name}")
+              start = source.rfind("static ", 0, pos)
+              if start < 0:
+                  raise SystemExit(f"Cannot locate declaration {name}")
+              brace = source.find("{", pos)
+              if brace < 0:
+                  raise SystemExit(f"Cannot locate body {name}")
               depth = 0
-              closing = None
-              for i in range(opening, len(text)):
-                  if text[i] == "{":
+              for i in range(brace, len(source)):
+                  if source[i] == "{":
                       depth += 1
-                  elif text[i] == "}":
+                  elif source[i] == "}":
                       depth -= 1
                       if depth == 0:
-                          closing = i + 1
-                          break
+                          return start, i + 1
+              raise SystemExit(f"Unclosed body {name}")
 
-              if closing is None:
-                  raise SystemExit(f"Unclosed function body: {name}")
+          def patch_callback(name, transform):
+              global text
+              start, end = function_bounds(text, name)
+              original = text[start:end]
+              updated = transform(original)
+              if updated != original:
+                  text = text[:start] + updated + text[end:]
+                  print(f"Patched {name}")
+              else:
+                  print(f"No change needed: {name}")
 
-              first_line = text.count("\n", 0, start) + 1
-              print(f"\n===== {name} (starts at line {first_line}) =====")
-              print(text[start:closing])
+          def patch_roc(fn):
+              if "u64 *cookie" in fn:
+                  fn = fn.replace("u64 *cookie", "u64 cookie", 1)
+              if "u64 cookie" not in fn:
+                  raise SystemExit("Unexpected remain_on_channel cookie")
+              if "const u8 *rx_addr" not in fn:
+                  fn = fn.replace(
+                      "u64 cookie",
+                      "u64 cookie, const u8 *rx_addr",
+                      1,
+                  )
+              fn = fn.replace(
+                  "*cookie = ATOMIC_INC_RETURN("
+                  " &pcfg80211_wdinfo->ro_ch_cookie_gen);",
+                  "/* Cookie supplied by cfg80211. */",
+              )
+              fn = fn.replace(
+                  "*cookie = ATOMIC_INC_RETURN("
+                  " &pcfg80211_wdinfo->ro_ch_cookie_gen ) ;",
+                  "/* Cookie supplied by cfg80211. */",
+              )
+              fn = fn.replace("*cookie", "cookie")
+              if "(void)rx_addr;" not in fn:
+                  fn = fn.replace(
+                      "{", "{\n\t(void)rx_addr;\n", 1
+                  )
+              return fn
+
+          def patch_mgmt(fn):
+              if "u64 *cookie" in fn:
+                  fn = fn.replace("u64 *cookie", "u64 cookie", 1)
+              if "u64 cookie" not in fn:
+                  raise SystemExit("Unexpected mgmt_tx cookie signature")
+              fn = fn.replace(
+                  "*cookie = pwdev_priv->mgmt_tx_cookie++;",
+                  "/* Cookie supplied by cfg80211. */",
+              )
+              fn = fn.replace("*cookie", "cookie")
+              return fn
+
+          patch_callback("cfg80211_rtw_remain_on_channel", patch_roc)
+          patch_callback("cfg80211_rtw_mgmt_tx", patch_mgmt)
+
+          path.write_text(text)
           PY
 
-      - name: Build module
-        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.audit_only) }}
+          echo "=== Patched callback signatures ==="
+          grep -n -A 8 -E \
+            'cfg80211_rtw_(add_key|get_key|del_key|set_default_mgmt_key|get_station|add_station|del_station|change_station|dump_station|remain_on_channel|mgmt_tx)\(' \
+            "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
+
+      - name: Configure conservative driver settings
         shell: bash
         run: |
           set -euxo pipefail
           cd "$DRIVER"
-          mkdir -p "$GITHUB_WORKSPACE/output"
 
+          # Preserve the scan-tested IPS setting.
+          python3 - Makefile <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          def set_value(key, value):
+              global text
+              pattern = re.compile(
+                  r"(?m)^" + re.escape(key) + r"\s*=.*$"
+              )
+              text, count = pattern.subn(
+                  f"{key} = {value}", text
+              )
+              if count != 1:
+                  raise SystemExit(
+                      f"STOP: expected one Makefile setting for {key}; "
+                      f"found {count}"
+                  )
+
+          set_value("CONFIG_POWER_SAVING", "y")
+          set_value("CONFIG_IPS_MODE", "0")
+          set_value("CONFIG_LPS_MODE", "default")
+          set_value("CONFIG_USB_AUTOSUSPEND", "n")
+          set_value("CONFIG_HW_PWRP_DETECTION", "n")
+          set_value("CONFIG_RTW_NAPI", "n")
+          set_value("CONFIG_RTW_GRO", "n")
+          set_value("CONFIG_RTW_DEBUG", "y")
+          set_value("CONFIG_RTW_SDIO_PM_KEEP_POWER", "y")
+
+          path.write_text(text)
+          PY
+
+          grep -E \
+            '^(CONFIG_POWER_SAVING|CONFIG_IPS_MODE|CONFIG_LPS_MODE|CONFIG_USB_AUTOSUSPEND|CONFIG_HW_PWRP_DETECTION|CONFIG_RTW_NAPI|CONFIG_RTW_GRO|CONFIG_RTW_DEBUG|CONFIG_RTW_SDIO_PM_KEEP_POWER)[[:space:]]*=' \
+            Makefile
+
+      - name: Build module
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p output
           {
-            echo "Build timestamp: $(date -u +%FT%TZ)"
-            echo "Source commit: 876e627a5b6a8021700391b4249a4a31edfebe5c"
-            echo "Kernel release target: 6.18.57-ophub"
-            echo "Header directory: $HDR"
+            echo "UTC build time: $(date -u +%FT%TZ)"
+            echo "Kernel release: $KERNEL_RELEASE"
+            echo "Driver repository: $DRIVER_REPO"
+            echo "Driver ref: $DRIVER_REF"
+            echo "Driver commit:"
+            cat output/source-commit.txt
+            echo "Header archive checksum:"
+            sha256sum header-6.18.57-ophub.tar.gz
+            echo "Kernel Module.symvers checksum:"
+            sha256sum "$HDR/Module.symvers"
             echo "Compiler:"
             aarch64-none-linux-gnu-gcc --version
-            echo "Kernel configuration identity:"
-            sha256sum "$GITHUB_WORKSPACE/kernel-6.18.57.config"
-          } | tee "$GITHUB_WORKSPACE/output/build-metadata.txt"
+          } | tee output/build-metadata.txt
+
+          cd "$DRIVER"
+          make clean
 
           make -j2 \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-none-linux-gnu- \
             KSRC="$HDR" \
-            KVER=6.18.57-ophub \
+            KVER="$KERNEL_RELEASE" \
             2>&1 | tee "$GITHUB_WORKSPACE/output/driver-build.log"
 
           KO="$(find . -type f -name 8189fs.ko -print -quit)"
           test -n "$KO"
-          cp "$KO" "$GITHUB_WORKSPACE/output/8189fs.ko"
-
-          echo "=== Module metadata ==="
-          file "$GITHUB_WORKSPACE/output/8189fs.ko"
-          /opt/arm-toolchain/bin/aarch64-none-linux-gnu-readelf -h \
+          install -m 0644 "$KO" \
             "$GITHUB_WORKSPACE/output/8189fs.ko"
-          strings "$GITHUB_WORKSPACE/output/8189fs.ko" |
-            grep -E 'vermagic=|depends=|alias=|license=' || true
 
-      - name: Upload diagnostic build artifacts
-        if: ${{ always() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.audit_only)) }}
+      - name: Verify module metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          KO="$GITHUB_WORKSPACE/output/8189fs.ko"
+
+          file "$KO"
+          /opt/arm-toolchain/bin/aarch64-none-linux-gnu-readelf \
+            -h "$KO"
+
+          STRINGS="$(strings "$KO")"
+          printf '%s\n' "$STRINGS" |
+            grep -F "vermagic=$KERNEL_RELEASE "
+
+          printf '%s\n' "$STRINGS" |
+            grep -F 'sdio:c*v024CdF179*'
+
+          printf '%s\n' "$STRINGS" |
+            grep -E 'depends=|license=|alias=' || true
+
+          sha256sum "$KO" | tee output/module.sha256
+          sha256sum "$HDR/Module.symvers" \
+            >> output/build-metadata.txt
+
+      - name: Upload build artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rtl8189fs-openwrt-6.18.57-ophub
@@ -488,3 +401,5 @@ jobs:
             output/8189fs.ko
             output/driver-build.log
             output/build-metadata.txt
+            output/source-commit.txt
+            output/module.sha256
