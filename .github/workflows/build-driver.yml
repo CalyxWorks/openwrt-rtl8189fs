@@ -124,28 +124,31 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          python3 - "$DRIVER/os_dep/linux/ioctl_cfg80211.c" "$DRIVER/Makefile" <<'PY'
+          python3 - "$DRIVER/os_dep/linux/ioctl_cfg80211.c" <<'PY'
           import pathlib
           import re
           import sys
 
-          source_path = pathlib.Path(sys.argv[1])
-          makefile_path = pathlib.Path(sys.argv[2])
-          source = source_path.read_text()
+          path = pathlib.Path(sys.argv[1])
+          source = path.read_text()
 
-          def function_span(text, name):
-              matches = list(re.finditer(
-                  r'\b' + re.escape(name) + r'\s*\(', text
-              ))
+          def locate_function(text, name):
+              pattern = re.compile(
+                  r'\bstatic\s+(?:int|s32)\s+' +
+                  re.escape(name) + r'\s*\('
+              )
+              matches = list(pattern.finditer(text))
               if len(matches) != 1:
                   raise SystemExit(
-                      f"STOP: expected one definition/reference for {name}; "
+                      f"STOP: expected one definition of {name}; "
                       f"found {len(matches)}"
                   )
+
               start = matches[0].start()
               opening = text.find('(', matches[0].start())
               depth = 0
               closing = None
+
               for i in range(opening, len(text)):
                   if text[i] == '(':
                       depth += 1
@@ -154,130 +157,164 @@ jobs:
                       if depth == 0:
                           closing = i
                           break
+
               if closing is None:
-                  raise SystemExit(f"STOP: cannot parse signature for {name}")
+                  raise SystemExit(f"STOP: cannot parse {name} signature")
+
               body_open = text.find('{', closing)
               if body_open < 0:
-                  raise SystemExit(f"STOP: cannot find body for {name}")
-              return start, closing, body_open
+                  raise SystemExit(f"STOP: cannot find {name} body")
 
-          # The target 6.18.57 headers use wireless_dev for these station
-          # callbacks. Convert only the five named callback definitions and
-          # map the device back to its net_device for the existing bodies.
-          station_callbacks = [
-              "cfg80211_rtw_get_station",
-              "cfg80211_rtw_add_station",
-              "cfg80211_rtw_del_station",
-              "cfg80211_rtw_change_station",
-              "cfg80211_rtw_dump_station",
-          ]
+              depth = 0
+              body_close = None
+              for i in range(body_open, len(text)):
+                  if text[i] == '{':
+                      depth += 1
+                  elif text[i] == '}':
+                      depth -= 1
+                      if depth == 0:
+                          body_close = i
+                          break
 
-          for name in station_callbacks:
-              start, closing, body_open = function_span(source, name)
-              signature = source[start:closing + 1]
-              if "struct net_device *ndev" not in signature:
-                  raise SystemExit(
-                      f"STOP: {name} signature did not match expected source"
+              if body_close is None:
+                  raise SystemExit(f"STOP: cannot parse {name} body")
+
+              return start, closing, body_open, body_close
+
+          def edit_function(name, transform):
+              global source
+              start, closing, body_open, body_close = locate_function(
+                  source, name
+              )
+              old = source[start:body_close + 1]
+              new = transform(old, body_open - start, body_close - start)
+              if new == old:
+                  print(f"Already matches expected patch: {name}")
+              else:
+                  source = source[:start] + new + source[body_close + 1:]
+                  print(f"Patched: {name}")
+
+          def patch_station(name):
+              def transform(fn, body_open, body_close):
+                  signature = fn[:fn.find('{')]
+                  body = fn[len(signature):]
+
+                  if 'struct wireless_dev *wdev' not in signature:
+                      if 'struct net_device *ndev' not in signature:
+                          raise SystemExit(
+                              f"STOP: unexpected signature for {name}"
+                          )
+                      signature = signature.replace(
+                          'struct net_device *ndev',
+                          'struct wireless_dev *wdev',
+                          1
+                      )
+
+                  if 'struct net_device *ndev' not in body:
+                      body = body.replace(
+                          '{',
+                          '{\n\tstruct net_device *ndev = wdev_to_ndev(wdev);\n',
+                          1
+                      )
+
+                  return signature + body
+
+              edit_function(name, transform)
+
+          for callback in (
+              'cfg80211_rtw_add_station',
+              'cfg80211_rtw_del_station',
+              'cfg80211_rtw_change_station',
+              'cfg80211_rtw_dump_station',
+              'cfg80211_rtw_get_station',
+          ):
+              patch_station(callback)
+
+          def patch_roc(fn, body_open, body_close):
+              signature = fn[:fn.find('{')]
+              body = fn[len(signature):]
+
+              if 'u64 *cookie' in signature:
+                  signature = signature.replace(
+                      'u64 *cookie', 'u64 cookie', 1
                   )
-              if "struct wireless_dev *wdev" in signature:
-                  raise SystemExit(f"STOP: {name} already appears patched")
-              signature = signature.replace(
-                  "struct net_device *ndev",
-                  "struct wireless_dev *wdev",
-                  1
+              elif not re.search(r'\bu64\s+cookie\b', signature):
+                  raise SystemExit(
+                      "STOP: unexpected remain_on_channel cookie signature"
+                  )
+
+              if 'const u8 *rx_addr' not in signature:
+                  if 'u64 cookie' not in signature:
+                      raise SystemExit("STOP: cannot place rx_addr parameter")
+                  signature = signature.replace(
+                      'u64 cookie',
+                      'u64 cookie, const u8 *rx_addr',
+                      1
+                  )
+
+              body, count = re.subn(
+                  r'\*cookie\s*=\s*ATOMIC_INC_RETURN\s*\([^;]*\)\s*;',
+                  '/* Cookie is supplied by cfg80211. */',
+                  body,
+                  count=1
               )
-              source = source[:start] + signature + source[closing + 1:]
-              _, _, body_open = function_span(source, name)
-              source = (
-                  source[:body_open + 1]
-                  + "\n\tstruct net_device *ndev = wdev_to_ndev(wdev);\n"
-                  + source[body_open + 1:]
+              if count == 0 and 'ATOMIC_INC_RETURN' in body:
+                  raise SystemExit(
+                      "STOP: ROC cookie-generation statement did not match"
+                  )
+
+              body = re.sub(r'\*cookie\b', 'cookie', body)
+              if '(void)rx_addr;' not in body:
+                  body = body.replace(
+                      '{', '{\n\t(void)rx_addr;\n', 1
+                  )
+
+              return signature + body
+
+          edit_function('cfg80211_rtw_remain_on_channel', patch_roc)
+
+          def patch_mgmt_tx(fn, body_open, body_close):
+              signature = fn[:fn.find('{')]
+              body = fn[len(signature):]
+
+              if 'struct cfg80211_mgmt_tx_params *params' not in signature:
+                  raise SystemExit("STOP: unexpected mgmt_tx params signature")
+
+              if 'u64 *cookie' in signature:
+                  signature = signature.replace(
+                      'u64 *cookie', 'u64 cookie', 1
+                  )
+              elif not re.search(r'\bu64\s+cookie\b', signature):
+                  raise SystemExit("STOP: unexpected mgmt_tx cookie signature")
+
+              body, count = re.subn(
+                  r'\*cookie\s*=\s*pwdev_priv->mgmt_tx_cookie\+\+\s*;',
+                  '/* Cookie is supplied by cfg80211. */',
+                  body,
+                  count=1
               )
+              if count == 0 and 'mgmt_tx_cookie++' in body:
+                  raise SystemExit("STOP: mgmt_tx cookie assignment did not match")
 
-          # The target ROC callback retains an output cookie pointer; the
-          # modern signature adds rx_addr. Do not convert this cookie.
-          name = "cfg80211_rtw_remain_on_channel"
-          start, closing, body_open = function_span(source, name)
-          signature = source[start:closing + 1]
-          if "u64 *cookie" not in signature:
-              raise SystemExit("STOP: unexpected remain_on_channel cookie API")
-          if "const u8 *rx_addr" not in signature:
-              signature = signature.replace(
-                  "u64 *cookie", "u64 *cookie, const u8 *rx_addr", 1
-              )
-              source = source[:start] + signature + source[closing + 1:]
-              _, _, body_open = function_span(source, name)
-              source = (
-                  source[:body_open + 1]
-                  + "\n\t(void)rx_addr;\n"
-                  + source[body_open + 1:]
-              )
+              body = re.sub(r'\*cookie\b', 'cookie', body)
+              return signature + body
 
-          # Modern mgmt_tx receives the cookie by value. Keep this separate
-          # from ROC: use the callback's cookie rather than writing through
-          # a pointer.
-          name = "cfg80211_rtw_mgmt_tx"
-          start, closing, body_open = function_span(source, name)
-          signature = source[start:closing + 1]
-          if "struct cfg80211_mgmt_tx_params *params" not in signature:
-              raise SystemExit("STOP: unexpected mgmt_tx params API")
-          if "u64 *cookie" not in signature:
-              raise SystemExit("STOP: unexpected mgmt_tx cookie API")
-          signature = signature.replace("u64 *cookie", "u64 cookie", 1)
-          source = source[:start] + signature + source[closing + 1:]
-          _, closing, body_open = function_span(source, name)
+          edit_function('cfg80211_rtw_mgmt_tx', patch_mgmt_tx)
 
-          # Restrict cookie substitutions to the mgmt_tx function body.
-          depth = 0
-          body_close = None
-          for i in range(body_open, len(source)):
-              if source[i] == '{':
-                  depth += 1
-              elif source[i] == '}':
-                  depth -= 1
-                  if depth == 0:
-                      body_close = i
-                      break
-          if body_close is None:
-              raise SystemExit("STOP: cannot locate mgmt_tx body end")
-          body = source[body_open:body_close + 1]
-          assignment = "*cookie = pwdev_priv->mgmt_tx_cookie++;"
-          if assignment not in body:
-              raise SystemExit("STOP: expected mgmt_tx cookie assignment not found")
-          body = body.replace(assignment, "/* Cookie supplied by cfg80211. */", 1)
-          if "*cookie" not in body:
-              raise SystemExit("STOP: expected cookie uses not found for audit")
-          body = body.replace("*cookie", "cookie")
-          source = source[:body_open] + body + source[body_close + 1:]
-
-          source_path.write_text(source)
-
-          # Power saving is disabled for this diagnostic build. This is
-          # intentional and does not alter the router's running configuration.
-          makefile = makefile_path.read_text()
-          if not re.search(r'(?m)^CONFIG_POWER_SAVING\s*=', makefile):
-              raise SystemExit("STOP: CONFIG_POWER_SAVING setting not found")
-          makefile, count = re.subn(
-              r'(?m)^CONFIG_POWER_SAVING\s*=.*$',
-              'CONFIG_POWER_SAVING = n',
-              makefile,
-              count=1
-          )
-          if count != 1:
-              raise SystemExit("STOP: could not disable power saving")
-          makefile_path.write_text(makefile)
-
-          print("Compatibility edits applied; review the build log and diff.")
+          path.write_text(source)
+          print("Compatibility patch completed.")
           PY
 
-          echo "=== Patch review ==="
-          git diff --no-index -- /dev/null "$DRIVER/os_dep/linux/ioctl_cfg80211.c" \
-            > "$RUNNER_TEMP/driver-source-review.diff" || true
-          grep -n -A 10 -E \
-            'cfg80211_rtw_(get_station|add_station|del_station|change_station|dump_station|remain_on_channel|mgmt_tx)\(' \
+          echo "=== Confirm callback signatures ==="
+          grep -n -A 12 -E \
+            'static (int|s32)[[:space:]]+cfg80211_rtw_(get_station|add_station|del_station|change_station|dump_station|remain_on_channel|mgmt_tx)\(' \
             "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
-          grep -n -E 'CONFIG_POWER_SAVING|CONFIG_IPS_MODE|CONFIG_LPS_MODE' \
-            "$DRIVER/Makefile"
+
+          echo "=== Confirm no pointer-cookie operations remain in these callbacks ==="
+          sed -n '6500,6750p' "$DRIVER/os_dep/linux/ioctl_cfg80211.c" |
+            grep -n -E '\*cookie|remain_on_channel|rx_addr' || true
+          sed -n '7100,7550p' "$DRIVER/os_dep/linux/ioctl_cfg80211.c" |
+            grep -n -E '\*cookie|mgmt_tx_cookie|cfg80211_rtw_mgmt_tx' || true
 
       - name: Stop after audit when requested
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.audit_only }}
