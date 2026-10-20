@@ -88,8 +88,25 @@ jobs:
         run: |
           set -euxo pipefail
 
-          test -s "$HDR/scripts/basic/fixdep.c"
-          gcc -O2 -o "$HDR/scripts/basic/fixdep" \
+          cat > "$RUNNER_TEMP/xalloc.h" <<'EOF'
+          #ifndef XALLOC_H
+          #define XALLOC_H
+          #include <stdlib.h>
+          #include <stdio.h>
+          static inline void *xmalloc(size_t size)
+          {
+              void *p = malloc(size);
+              if (!p) {
+                  perror("fixdep: malloc");
+                  exit(1);
+              }
+              return p;
+          }
+          #endif
+          EOF
+
+          gcc -O2 -I "$RUNNER_TEMP" \
+            -o "$HDR/scripts/basic/fixdep" \
             "$HDR/scripts/basic/fixdep.c"
 
           file "$HDR/scripts/basic/fixdep"
