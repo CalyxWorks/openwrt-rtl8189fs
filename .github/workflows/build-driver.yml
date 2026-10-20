@@ -125,6 +125,26 @@ jobs:
             -e '7235,7285p' \
             -e '9770,9885p' \
             "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
+
+      - name: Diagnose cfg80211 header API
+        shell: bash
+        run: |
+          set -eu
+
+          echo "===== HEADER KERNEL VERSION ====="
+          grep -R -n 'LINUX_VERSION_CODE' \
+            "$HDR/include/generated" "$HDR/include/linux" \
+            2>/dev/null | head -20 || true
+
+          echo "===== CFG80211 CALLBACK SIGNATURES ====="
+          grep -n -B 3 -A 6 -E \
+            '\(\*(get_station|add_station|del_station|change_station|dump_station|remain_on_channel|mgmt_tx)\)' \
+            "$HDR/include/net/cfg80211.h" || true
+
+          echo "===== DRIVER VERSION GUARDS ====="
+          grep -n -E \
+            'KERNEL_VERSION\(7, 1, 0\)|cfg80211_rtw_(get_station|add_station|del_station|change_station|dump_station|remain_on_channel|mgmt_tx)' \
+            "$DRIVER/os_dep/linux/ioctl_cfg80211.c" | tail -60
           
       - name: Build kernel module
         shell: bash
