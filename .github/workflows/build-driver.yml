@@ -83,14 +83,17 @@ jobs:
           echo "===== HEADER TREE ====="
           ls -lh "$HDR/Module.symvers" "$HDR/Makefile"
 
-      - name: Rebuild kernel build helpers
+      - name: Rebuild fixdep for GitHub runner
         shell: bash
         run: |
           set -euxo pipefail
 
-          make -C "$HDR" scripts
+          test -s "$HDR/scripts/basic/fixdep.c"
+          gcc -O2 -o "$HDR/scripts/basic/fixdep" \
+            "$HDR/scripts/basic/fixdep.c"
+
           file "$HDR/scripts/basic/fixdep"
-          "$HDR/scripts/basic/fixdep" 2>&1 || true
+          file "$HDR/scripts/mod/modpost"
           
       - name: Build kernel module
         shell: bash
