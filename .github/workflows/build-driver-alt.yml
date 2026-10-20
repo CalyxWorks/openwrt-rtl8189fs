@@ -220,6 +220,10 @@ jobs:
             'CONFIG_POWER_SAVING|CONFIG_IPS_MODE|CONFIG_LPS_MODE' \
             "$SRC/Makefile"
 
+          echo "===== COOKIE USES IN CALLBACKS ====="
+            sed -n '6564,6720p' "$FILE" | grep -n -C 3 -E 'cookie|remain_on_channel'
+            sed -n '7145,7500p' "$FILE" | grep -n -C 3 -E 'cookie|mgmt_tx'
+
       - name: Diagnose actual cfg80211 header API
         shell: bash
         run: |
