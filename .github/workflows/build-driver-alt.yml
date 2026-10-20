@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       audit_only:
-        description: "Audit cfg80211 compatibility only; do not compile"
+        description: "Audit source and cfg80211 compatibility only; do not compile"
         required: true
         type: boolean
         default: true
@@ -53,45 +53,57 @@ jobs:
           echo "$RUNNER_TEMP/arm-gcc/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/arm-gcc/bin/aarch64-none-linux-gnu-gcc" --version
 
-      - name: Download alternative RTL8189FS source
+      - name: Download pinned jwrdegoede RTL8189FS source
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$RUNNER_TEMP/driver" "$RUNNER_TEMP/headers"
 
-          curl -fL --retry 3 \
-            "https://github.com/gustiarto/rtl8189fs-armbian/archive/refs/heads/main.tar.gz" \
+          SOURCE_COMMIT="876e627a5b6a8021700391b4249a4a31edfebe5c"
+          SOURCE_URL="https://github.com/jwrdegoede/rtl8189ES_linux/archive/${SOURCE_COMMIT}.tar.gz"
+
+          curl -fL --retry 3 "$SOURCE_URL" \
             -o "$RUNNER_TEMP/rtl8189fs-source.tar.gz"
+
+          echo "===== SOURCE ARCHIVE CHECKSUM ====="
+          sha256sum "$RUNNER_TEMP/rtl8189fs-source.tar.gz"
 
           tar -xzf "$RUNNER_TEMP/rtl8189fs-source.tar.gz" \
             -C "$RUNNER_TEMP/driver"
 
           DRIVER_FILE="$(find "$RUNNER_TEMP/driver" -type f \
             -path '*/os_dep/linux/ioctl_cfg80211.c' -print -quit)"
-          test -n "$DRIVER_FILE"
+
+          if [ -z "$DRIVER_FILE" ]; then
+            echo "ERROR: Could not find os_dep/linux/ioctl_cfg80211.c"
+            echo "===== EXTRACTED SOURCE FILES ====="
+            find "$RUNNER_TEMP/driver" -maxdepth 4 -type f | head -200
+            exit 1
+          fi
 
           DRIVER="$(dirname "$(dirname "$(dirname "$DRIVER_FILE")")")"
           test -f "$DRIVER/Makefile"
 
           echo "DRIVER=$DRIVER" >> "$GITHUB_ENV"
+
           echo "===== DRIVER SOURCE ====="
           echo "$DRIVER"
+          echo "Pinned commit: $SOURCE_COMMIT"
 
-          echo "===== IPS CONFIGURATION BEFORE CHANGE ====="
-          grep -n 'CONFIG_IPS_MODE' "$DRIVER/Makefile" || true
+          echo "===== DRIVER CONFIGURATION SETTINGS ====="
+          grep -n -E \
+            'CONFIG_(IPS_MODE|POWER_SAVING|LPS|FW|WOWLAN)|IPS_MODE|POWER_SAVING' \
+            "$DRIVER/Makefile" "$DRIVER/include" \
+            --include='Makefile' --include='*.h' 2>/dev/null || true
 
-          if grep -q '^[[:space:]]*CONFIG_IPS_MODE[[:space:]]*=' \
-            "$DRIVER/Makefile"; then
-            sed -i \
-              's/^[[:space:]]*CONFIG_IPS_MODE[[:space:]]*=.*/CONFIG_IPS_MODE = 0/' \
-              "$DRIVER/Makefile"
-          else
-            echo "ERROR: CONFIG_IPS_MODE setting not found in Makefile"
-            exit 1
-          fi
+          echo "===== DRIVER BUILD OPTIONS ====="
+          sed -n '1,240p' "$DRIVER/Makefile"
 
-          echo "===== IPS CONFIGURATION AFTER CHANGE ====="
-          grep -n 'CONFIG_IPS_MODE' "$DRIVER/Makefile"
+          echo "===== SOURCE VERSION GUARDS ====="
+          grep -R -n -E \
+            --include='*.c' --include='*.h' \
+            'KERNEL_VERSION\((6|7),[[:space:]]*[0-9]+,[[:space:]]*[0-9]+\)' \
+            "$DRIVER/os_dep/linux" | head -240 || true
 
       - name: Extract kernel headers
         shell: bash
@@ -153,6 +165,7 @@ jobs:
         run: |
           set -eu
           SRC="$DRIVER"
+          FILE="$SRC/os_dep/linux/ioctl_cfg80211.c"
 
           echo "===== ALL 7.1.0 GUARDS IN DRIVER ====="
           grep -R -n -B 5 -A 10 \
@@ -163,10 +176,7 @@ jobs:
           grep -R -n -E \
             --include='*.c' --include='*.h' \
             'KERNEL_VERSION\((6|7),[[:space:]]*[0-9]+,[[:space:]]*[0-9]+\)' \
-            "$SRC/os_dep/linux" | grep -E \
-            'cfg80211|ioctl_cfg80211|7, 1|7, 2|7, 3' | head -200 || true
-
-          FILE="$SRC/os_dep/linux/ioctl_cfg80211.c"
+            "$SRC/os_dep/linux" | head -240 || true
 
           echo "===== STATION CALLBACK DEFINITIONS ====="
           grep -n -B 8 -A 24 -E \
@@ -177,6 +187,11 @@ jobs:
           grep -n -B 8 -A 35 -E \
             'cfg80211_rtw_(remain_on_channel|cancel_remain_on_channel|mgmt_tx)\(' \
             "$FILE" || true
+
+          echo "===== CFG80211 OPS INITIALIZER ====="
+          grep -n -B 12 -A 90 -E \
+            'static const struct cfg80211_ops|struct cfg80211_ops' \
+            "$FILE" | tail -180 || true
 
           echo "===== STATION NOTIFICATION CALLS ====="
           grep -R -n -B 6 -A 8 -E \
@@ -205,7 +220,7 @@ jobs:
           echo "===== DRIVER VERSION GUARDS AND CALLBACK REFERENCES ====="
           grep -n -E \
             'KERNEL_VERSION\(7, 1, 0\)|KERNEL_VERSION\(7, 2, 0\)|KERNEL_VERSION\(7, 3, 0\)|cfg80211_rtw_(get_station|add_station|del_station|change_station|dump_station|remain_on_channel|cancel_remain_on_channel|mgmt_tx)' \
-            "$DRIVER/os_dep/linux/ioctl_cfg80211.c" | tail -100 || true
+            "$DRIVER/os_dep/linux/ioctl_cfg80211.c" | tail -140 || true
 
       - name: Build kernel module
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.audit_only != true }}
@@ -216,6 +231,7 @@ jobs:
           export CROSS_COMPILE=aarch64-none-linux-gnu-
 
           cd "$DRIVER"
+
           make -j2 ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
             KSRC="$HDR" KVER=6.18.57-ophub \
             2>&1 | tee "$RUNNER_TEMP/driver-build.log"
@@ -234,11 +250,14 @@ jobs:
           sha256sum "$GITHUB_WORKSPACE/output/8189fs.ko"
           file "$GITHUB_WORKSPACE/output/8189fs.ko"
 
+          echo "===== MODULE METADATA ====="
+          modinfo "$GITHUB_WORKSPACE/output/8189fs.ko" || true
+
       - name: Save compiler error log
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.audit_only != true) }}
         uses: actions/upload-artifact@v4
         with:
-          name: alternative-driver-build-log
+          name: pinned-driver-build-log
           path: ${{ runner.temp }}/driver-build.log
           if-no-files-found: warn
           retention-days: 14
@@ -247,7 +266,7 @@ jobs:
         if: ${{ success() && (github.event_name != 'workflow_dispatch' || inputs.audit_only != true) }}
         uses: actions/upload-artifact@v4
         with:
-          name: rtl8189fs-armbian-openwrt-6.18.57
+          name: rtl8189fs-pinned-openwrt-6.18.57
           path: output/8189fs.ko
           if-no-files-found: error
           retention-days: 14
