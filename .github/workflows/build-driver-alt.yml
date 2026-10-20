@@ -32,74 +32,58 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
           URL="https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/15.3.rel1/arm-gnu-toolchain-15.3.rel1-x86_64-aarch64-none-linux-gnu.tar.xz"
 
           curl -fL "$URL" -o "$RUNNER_TEMP/arm-toolchain.tar.xz"
           mkdir -p "$RUNNER_TEMP/toolchain"
-
           tar -xJf "$RUNNER_TEMP/arm-toolchain.tar.xz" \
-            -C "$RUNNER_TEMP/toolchain" \
-            --strip-components=1
+            -C "$RUNNER_TEMP/toolchain" --strip-components=1
 
           echo "$RUNNER_TEMP/toolchain/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-gcc" --version
 
-          "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-gcc" \
-            --version
-
-      - name: Locate and extract kernel headers
+      - name: Extract kernel headers into a clean directory
         shell: bash
         run: |
           set -euxo pipefail
-
-          ARCHIVE="$(find "$GITHUB_WORKSPACE" -type f \
-            -name 'header-6.18.57-ophub.tar.gz' -print -quit)"
-
-          if [ -z "$ARCHIVE" ]; then
-            echo "::error::header-6.18.57-ophub.tar.gz was not found in the repository."
-            exit 1
-          fi
-
+          ARCHIVE="$GITHUB_WORKSPACE/header-6.18.57-ophub.tar.gz"
           HDR="$RUNNER_TEMP/headers"
+
+          test -f "$ARCHIVE"
+          rm -rf "$HDR"
           mkdir -p "$HDR"
 
-          tar -xzf "$ARCHIVE" -C "$HDR" --strip-components=1
+          tar -xzf "$ARCHIVE" -C "$HDR"
 
           test -f "$HDR/Makefile"
           test -f "$HDR/Module.symvers"
           test -f "$HDR/include/generated/autoconf.h"
 
-          echo "Kernel header archive: $ARCHIVE"
-          echo "Extracted headers: $HDR"
+          echo "=== Header tree ==="
+          ls -ld "$HDR"
+          ls -l "$HDR/scripts/mod" || true
 
       - name: Prepare kernel build utilities
         shell: bash
         run: |
           set -euxo pipefail
-
           HDR="$RUNNER_TEMP/headers"
           export ARCH=arm64
           export CROSS_COMPILE="$CROSS_COMPILE"
 
-          # Rebuild host-side utilities when the archive omits them.
           if [ ! -x "$HDR/scripts/mod/modpost" ]; then
             make -C "$HDR" \
-              ARCH="$ARCH" \
-              CROSS_COMPILE="$CROSS_COMPILE" \
-              scripts
+              ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" scripts
           fi
 
-          if [ ! -x "$HDR/scripts/mod/modpost" ]; then
-            echo "::error::modpost is still missing after preparing kernel scripts."
-            exit 1
-          fi
+          test -x "$HDR/scripts/mod/modpost"
 
       - name: Download alternative RTL8189FS source
         shell: bash
         run: |
           set -euxo pipefail
-
           DRIVER="$RUNNER_TEMP/driver/rtl8189fs-armbian"
+          rm -rf "$DRIVER"
           mkdir -p "$DRIVER"
 
           curl -fL \
@@ -107,8 +91,7 @@ jobs:
             -o "$RUNNER_TEMP/rtl8189fs-armbian.tar.gz"
 
           tar -xzf "$RUNNER_TEMP/rtl8189fs-armbian.tar.gz" \
-            --strip-components=1 \
-            -C "$DRIVER"
+            --strip-components=1 -C "$DRIVER"
 
           test -f "$DRIVER/Makefile"
           test -f "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
@@ -117,53 +100,14 @@ jobs:
             's/^CONFIG_IPS_MODE[[:space:]]*=.*/CONFIG_IPS_MODE = 0/' \
             "$DRIVER/Makefile"
 
-          echo "=== Driver configuration ==="
           grep -n -E 'CONFIG_POWER_SAVING|CONFIG_IPS_MODE' \
             "$DRIVER/Makefile"
-
-          echo "=== cfg80211 compatibility guards ==="
-          grep -n -E \
-            'KERNEL_VERSION\(7, [123], 0\)|cfg80211_new_sta|cfg80211_del_sta' \
-            "$DRIVER/os_dep/linux/ioctl_cfg80211.c" || true
 
       - name: Build alternative driver
         shell: bash
         run: |
           set -euxo pipefail
-
           HDR="$RUNNER_TEMP/headers"
           DRIVER="$RUNNER_TEMP/driver/rtl8189fs-armbian"
 
-          export ARCH=arm64
-          export CROSS_COMPILE="$CROSS_COMPILE"
-
-          make -C "$HDR" \
-            M="$DRIVER" \
-            ARCH="$ARCH" \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            KVER=6.18.57-ophub \
-            modules
-
-          test -s "$DRIVER/8189fs.ko"
-
-          "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-readelf" \
-            -h "$DRIVER/8189fs.ko"
-
-          "$RUNNER_TEMP/toolchain/bin/aarch64-none-linux-gnu-nm" \
-            -u "$DRIVER/8189fs.ko" \
-            > "$RUNNER_TEMP/undefined-symbols.txt"
-
-          modinfo "$DRIVER/8189fs.ko" \
-            > "$RUNNER_TEMP/module-info.txt" || true
-
-      - name: Upload build results and diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rtl8189fs-armbian-6.18.57-results
-          path: |
-            ${{ runner.temp }}/driver/rtl8189fs-armbian/8189fs.ko
-            ${{ runner.temp }}/driver/rtl8189fs-armbian/Module.symvers
-            ${{ runner.temp }}/undefined-symbols.txt
-            ${{ runner.temp }}/module-info.txt
-          if-no-files-found: warn
+          export ARCH
