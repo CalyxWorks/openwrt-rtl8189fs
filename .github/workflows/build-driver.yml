@@ -1,15 +1,19 @@
-
+# Build RTL8189FS for OpenWrt 6.18.57
 name: Build RTL8189FS for OpenWrt 6.18.57
 
 on:
   workflow_dispatch:
+    inputs:
+      audit_only:
+        description: "Audit source and kernel headers without compiling"
+        required: true
+        type: boolean
+        default: true
   push:
     paths:
-      - "build-driver.yml"
-      - "kernel-6.18.57.config"
-      - "rtl8189fs-6.18.57-test.tar.gz"
-      - "header-6.18.57-ophub.tar.gz"
       - ".github/workflows/build-driver.yml"
+      - "kernel-6.18.57.config"
+      - "header-6.18.57-ophub.tar.gz"
 
 permissions:
   contents: read
@@ -20,185 +24,324 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Check out repository
+      - name: Check out workflow inputs
         uses: actions/checkout@v4
 
-      - name: Check uploaded inputs
-        shell: bash
+      - name: Install build dependencies
         run: |
-          set -euxo pipefail
-          test -s kernel-6.18.57.config
-          test -s rtl8189fs-6.18.57-test.tar.gz
-          test -s header-6.18.57-ophub.tar.gz
-          sha256sum kernel-6.18.57.config \
-            rtl8189fs-6.18.57-test.tar.gz \
-            header-6.18.57-ophub.tar.gz
-
-      - name: Install build utilities
-        run: |
+          set -eux
           sudo apt-get update
-          sudo apt-get install -y build-essential bc bison flex \
-            libssl-dev libelf-dev dwarves xz-utils
+          sudo apt-get install -y \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev dwarves \
+            xz-utils zstd curl python3
 
-      - name: Install matching Arm GCC
-        shell: bash
+      - name: Install ARM GNU Toolchain
         run: |
-          set -euxo pipefail
+          set -eux
           URL="https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/15.3.rel1/arm-gnu-toolchain-15.3.rel1-x86_64-aarch64-none-linux-gnu.tar.xz"
-          curl -fL --retry 3 "$URL" -o "$RUNNER_TEMP/arm-gcc.tar.xz"
-          mkdir -p "$RUNNER_TEMP/arm-gcc"
-          tar -xJf "$RUNNER_TEMP/arm-gcc.tar.xz" \
-            -C "$RUNNER_TEMP/arm-gcc" --strip-components=1
-          echo "$RUNNER_TEMP/arm-gcc/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/arm-gcc/bin/aarch64-none-linux-gnu-gcc" \
-            --version
+          curl --fail --location --retry 3 "$URL" -o /tmp/arm-toolchain.tar.xz
+          sudo mkdir -p /opt/arm-toolchain
+          sudo tar -xJf /tmp/arm-toolchain.tar.xz \
+            --strip-components=1 -C /opt/arm-toolchain
+          echo "/opt/arm-toolchain/bin" >> "$GITHUB_PATH"
+          /opt/arm-toolchain/bin/aarch64-none-linux-gnu-gcc --version
 
-      - name: Extract driver and kernel headers
+      - name: Verify required repository inputs
+        run: |
+          set -eux
+          test -s header-6.18.57-ophub.tar.gz
+          test -s kernel-6.18.57.config
+          sha256sum header-6.18.57-ophub.tar.gz kernel-6.18.57.config
+
+      - name: Extract and validate kernel headers
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p "$RUNNER_TEMP/driver" "$RUNNER_TEMP/headers"
-          tar -xzf rtl8189fs-6.18.57-test.tar.gz \
-            -C "$RUNNER_TEMP/driver"
-          tar -xzf header-6.18.57-ophub.tar.gz \
-            -C "$RUNNER_TEMP/headers"
+          mkdir -p "$RUNNER_TEMP/kernel-headers"
+          tar -xf header-6.18.57-ophub.tar.gz \
+            -C "$RUNNER_TEMP/kernel-headers"
 
-          DRIVER="$RUNNER_TEMP/driver/rtl8189fs-6.18.57-test"
-          test -f "$DRIVER/Makefile"
-          echo "DRIVER=$DRIVER" >> "$GITHUB_ENV"
-
-          SYMVERS="$(find "$RUNNER_TEMP/headers" \
+          SYMVERS="$(find "$RUNNER_TEMP/kernel-headers" \
             -type f -name Module.symvers -print -quit)"
           test -n "$SYMVERS"
           HDR="$(dirname "$SYMVERS")"
-
-          test -f "$HDR/Makefile"
-          test -f "$HDR/include/config/auto.conf"
-          test -f "$HDR/include/generated/utsrelease.h"
-          test -x "$HDR/scripts/mod/modpost"
-
           echo "HDR=$HDR" >> "$GITHUB_ENV"
-          echo "===== KERNEL RELEASE ====="
+
+          test -s "$HDR/Makefile"
+          test -s "$HDR/include/config/auto.conf"
+          test -s "$HDR/include/generated/utsrelease.h"
+          test -s "$HDR/scripts/mod/modpost"
+          test -s "$HDR/scripts/basic/fixdep.c"
+
+          echo "=== Kernel release ==="
           cat "$HDR/include/generated/utsrelease.h"
-          echo "===== HEADER TREE ====="
-          ls -lh "$HDR/Module.symvers" "$HDR/Makefile"
+          echo "=== Kernel version code ==="
+          grep -n 'LINUX_VERSION_CODE' \
+            "$HDR/include/generated/uapi/linux/version.h" \
+            "$HDR/include/linux/version.h" 2>/dev/null || true
+          echo "=== Header directory ==="
+          echo "$HDR"
 
-      - name: Rebuild fixdep for GitHub runner
+      - name: Download pinned upstream RTL8189FS source
+        run: |
+          set -eux
+          URL="https://github.com/jwrdegoede/rtl8189ES_linux/archive/876e627a5b6a8021700391b4249a4a31edfebe5c.tar.gz"
+          curl --fail --location --retry 3 "$URL" \
+            -o "$RUNNER_TEMP/rtl8189fs-source.tar.gz"
+          mkdir -p "$RUNNER_TEMP/driver"
+          tar -xzf "$RUNNER_TEMP/rtl8189fs-source.tar.gz" \
+            --strip-components=1 -C "$RUNNER_TEMP/driver"
+          echo "DRIVER=$RUNNER_TEMP/driver" >> "$GITHUB_ENV"
+
+      - name: Audit kernel callback API
         shell: bash
         run: |
           set -euxo pipefail
+          echo "=== Kernel station callback declarations ==="
+          grep -n -A 8 -B 2 -E \
+            '(\*add_station|\*del_station|\*change_station|\*get_station|\*dump_station)' \
+            "$HDR/include/net/cfg80211.h"
 
-          cat > "$RUNNER_TEMP/xalloc.h" <<'EOF'
-          #ifndef XALLOC_H
-          #define XALLOC_H
-          #include <stdlib.h>
-          #include <stdio.h>
-          static inline void *xmalloc(size_t size)
-          {
-              void *p = malloc(size);
-              if (!p) {
-                  perror("fixdep: malloc");
-                  exit(1);
-              }
-              return p;
-          }
-          #endif
-          EOF
+          echo "=== Kernel remain-on-channel declaration ==="
+          grep -n -A 8 -B 2 '(\*remain_on_channel)' \
+            "$HDR/include/net/cfg80211.h"
 
-          gcc -O2 -I "$RUNNER_TEMP" \
-            -o "$HDR/scripts/basic/fixdep" \
-            "$HDR/scripts/basic/fixdep.c"
+          echo "=== Kernel management-transmit declaration ==="
+          grep -n -A 8 -B 2 '(\*mgmt_tx)' \
+            "$HDR/include/net/cfg80211.h"
 
-          file "$HDR/scripts/basic/fixdep"
-          file "$HDR/scripts/mod/modpost"
+          echo "=== Driver callback definitions ==="
+          grep -n -A 12 -E \
+            'cfg80211_rtw_(add_station|del_station|change_station|get_station|dump_station|remain_on_channel|mgmt_tx)\(' \
+            "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
 
-      - name: Audit cfg80211 compatibility across driver
-        shell: bash
-        run: |
-          set -eu
-          SRC="$DRIVER"
-          HDR="$HDR"
+          echo "=== Power-saving build settings ==="
+          grep -n -E 'CONFIG_POWER_SAVING|CONFIG_IPS_MODE|CONFIG_LPS_MODE' \
+            "$DRIVER/Makefile"
 
-          echo "===== ALL 7.1.0 GUARDS IN DRIVER ====="
-          grep -R -n -B 4 -A 8 \
-            --include='*.c' --include='*.h' \
-            'KERNEL_VERSION(7, 1, 0)' "$SRC" || true
-
-          echo "===== STATION CALLBACK DEFINITIONS ====="
-          FILE="$SRC/os_dep/linux/ioctl_cfg80211.c"
-          grep -n -B 8 -A 24 -E \
-            'cfg80211_rtw_(get_station|add_station|del_station|change_station|dump_station)\(' \
-            "$FILE" || true
-
-          echo "===== REMAIN-ON-CHANNEL AND MGMT-TX DEFINITIONS ====="
-          grep -n -B 8 -A 35 -E \
-            'cfg80211_rtw_(remain_on_channel|cancel_remain_on_channel|mgmt_tx)\(' \
-            "$FILE" || true
-
-          echo "===== STATION NOTIFICATION CALLS ====="
-          grep -n -B 6 -A 8 -E \
-            'cfg80211_(new_sta|del_sta)\(' "$SRC" || true
-
-          echo "===== ACTUAL HEADER PROTOTYPES ====="
-          grep -n -B 3 -A 7 -E \
-            '(\*get_station|\*add_station|\*del_station|\*change_station|\*dump_station|\*remain_on_channel|\*cancel_remain_on_channel|\*mgmt_tx|cfg80211_new_sta\(|cfg80211_del_sta\()' \
-            "$HDR/include/net/cfg80211.h" || true
-
-      - name: Diagnose cfg80211 header API
-        shell: bash
-        run: |
-          set -eu
-
-          echo "===== HEADER KERNEL VERSION ====="
-          grep -R -n 'LINUX_VERSION_CODE' \
-            "$HDR/include/generated" "$HDR/include/linux" \
-            2>/dev/null | head -20 || true
-
-          echo "===== CFG80211 CALLBACK SIGNATURES ====="
-          grep -n -B 3 -A 6 -E \
-            '\(\*(get_station|add_station|del_station|change_station|dump_station|remain_on_channel|mgmt_tx)\)' \
-            "$HDR/include/net/cfg80211.h" || true
-
-          echo "===== DRIVER VERSION GUARDS ====="
-          grep -n -E \
-            'KERNEL_VERSION\(7, 1, 0\)|cfg80211_rtw_(get_station|add_station|del_station|change_station|dump_station|remain_on_channel|mgmt_tx)' \
-            "$DRIVER/os_dep/linux/ioctl_cfg80211.c" | tail -60
-          
-      - name: Build kernel module
+      - name: Apply checked compatibility changes
         shell: bash
         run: |
           set -euxo pipefail
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-none-linux-gnu-
+          python3 - "$DRIVER/os_dep/linux/ioctl_cfg80211.c" "$DRIVER/Makefile" <<'PY'
+          import pathlib
+          import re
+          import sys
 
+          source_path = pathlib.Path(sys.argv[1])
+          makefile_path = pathlib.Path(sys.argv[2])
+          source = source_path.read_text()
+
+          def function_span(text, name):
+              matches = list(re.finditer(
+                  r'\b' + re.escape(name) + r'\s*\(', text
+              ))
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"STOP: expected one definition/reference for {name}; "
+                      f"found {len(matches)}"
+                  )
+              start = matches[0].start()
+              opening = text.find('(', matches[0].start())
+              depth = 0
+              closing = None
+              for i in range(opening, len(text)):
+                  if text[i] == '(':
+                      depth += 1
+                  elif text[i] == ')':
+                      depth -= 1
+                      if depth == 0:
+                          closing = i
+                          break
+              if closing is None:
+                  raise SystemExit(f"STOP: cannot parse signature for {name}")
+              body_open = text.find('{', closing)
+              if body_open < 0:
+                  raise SystemExit(f"STOP: cannot find body for {name}")
+              return start, closing, body_open
+
+          # The target 6.18.57 headers use wireless_dev for these station
+          # callbacks. Convert only the five named callback definitions and
+          # map the device back to its net_device for the existing bodies.
+          station_callbacks = [
+              "cfg80211_rtw_get_station",
+              "cfg80211_rtw_add_station",
+              "cfg80211_rtw_del_station",
+              "cfg80211_rtw_change_station",
+              "cfg80211_rtw_dump_station",
+          ]
+
+          for name in station_callbacks:
+              start, closing, body_open = function_span(source, name)
+              signature = source[start:closing + 1]
+              if "struct net_device *ndev" not in signature:
+                  raise SystemExit(
+                      f"STOP: {name} signature did not match expected source"
+                  )
+              if "struct wireless_dev *wdev" in signature:
+                  raise SystemExit(f"STOP: {name} already appears patched")
+              signature = signature.replace(
+                  "struct net_device *ndev",
+                  "struct wireless_dev *wdev",
+                  1
+              )
+              source = source[:start] + signature + source[closing + 1:]
+              _, _, body_open = function_span(source, name)
+              source = (
+                  source[:body_open + 1]
+                  + "\n\tstruct net_device *ndev = wdev_to_ndev(wdev);\n"
+                  + source[body_open + 1:]
+              )
+
+          # The target ROC callback retains an output cookie pointer; the
+          # modern signature adds rx_addr. Do not convert this cookie.
+          name = "cfg80211_rtw_remain_on_channel"
+          start, closing, body_open = function_span(source, name)
+          signature = source[start:closing + 1]
+          if "u64 *cookie" not in signature:
+              raise SystemExit("STOP: unexpected remain_on_channel cookie API")
+          if "const u8 *rx_addr" not in signature:
+              signature = signature.replace(
+                  "u64 *cookie", "u64 *cookie, const u8 *rx_addr", 1
+              )
+              source = source[:start] + signature + source[closing + 1:]
+              _, _, body_open = function_span(source, name)
+              source = (
+                  source[:body_open + 1]
+                  + "\n\t(void)rx_addr;\n"
+                  + source[body_open + 1:]
+              )
+
+          # Modern mgmt_tx receives the cookie by value. Keep this separate
+          # from ROC: use the callback's cookie rather than writing through
+          # a pointer.
+          name = "cfg80211_rtw_mgmt_tx"
+          start, closing, body_open = function_span(source, name)
+          signature = source[start:closing + 1]
+          if "struct cfg80211_mgmt_tx_params *params" not in signature:
+              raise SystemExit("STOP: unexpected mgmt_tx params API")
+          if "u64 *cookie" not in signature:
+              raise SystemExit("STOP: unexpected mgmt_tx cookie API")
+          signature = signature.replace("u64 *cookie", "u64 cookie", 1)
+          source = source[:start] + signature + source[closing + 1:]
+          _, closing, body_open = function_span(source, name)
+
+          # Restrict cookie substitutions to the mgmt_tx function body.
+          depth = 0
+          body_close = None
+          for i in range(body_open, len(source)):
+              if source[i] == '{':
+                  depth += 1
+              elif source[i] == '}':
+                  depth -= 1
+                  if depth == 0:
+                      body_close = i
+                      break
+          if body_close is None:
+              raise SystemExit("STOP: cannot locate mgmt_tx body end")
+          body = source[body_open:body_close + 1]
+          assignment = "*cookie = pwdev_priv->mgmt_tx_cookie++;"
+          if assignment not in body:
+              raise SystemExit("STOP: expected mgmt_tx cookie assignment not found")
+          body = body.replace(assignment, "/* Cookie supplied by cfg80211. */", 1)
+          if "*cookie" not in body:
+              raise SystemExit("STOP: expected cookie uses not found for audit")
+          body = body.replace("*cookie", "cookie")
+          source = source[:body_open] + body + source[body_close + 1:]
+
+          source_path.write_text(source)
+
+          # Power saving is disabled for this diagnostic build. This is
+          # intentional and does not alter the router's running configuration.
+          makefile = makefile_path.read_text()
+          if not re.search(r'(?m)^CONFIG_POWER_SAVING\s*=', makefile):
+              raise SystemExit("STOP: CONFIG_POWER_SAVING setting not found")
+          makefile, count = re.subn(
+              r'(?m)^CONFIG_POWER_SAVING\s*=.*$',
+              'CONFIG_POWER_SAVING = n',
+              makefile,
+              count=1
+          )
+          if count != 1:
+              raise SystemExit("STOP: could not disable power saving")
+          makefile_path.write_text(makefile)
+
+          print("Compatibility edits applied; review the build log and diff.")
+          PY
+
+          echo "=== Patch review ==="
+          git diff --no-index -- /dev/null "$DRIVER/os_dep/linux/ioctl_cfg80211.c" \
+            > "$RUNNER_TEMP/driver-source-review.diff" || true
+          grep -n -A 10 -E \
+            'cfg80211_rtw_(get_station|add_station|del_station|change_station|dump_station|remain_on_channel|mgmt_tx)\(' \
+            "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
+          grep -n -E 'CONFIG_POWER_SAVING|CONFIG_IPS_MODE|CONFIG_LPS_MODE' \
+            "$DRIVER/Makefile"
+
+      - name: Stop after audit when requested
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.audit_only }}
+        run: |
+          echo "Audit-only run complete. No module was compiled or uploaded."
+          echo "Review the API audit and compatibility-edit output before a build run."
+
+      - name: Prepare native fixdep
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.audit_only) }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Do not rebuild modpost or conf. Rebuild only fixdep for the
+          # runner's native architecture if the archive's copy cannot run.
+          if ! "$HDR/scripts/basic/fixdep" --help >/dev/null 2>&1; then
+            echo "The archived fixdep is not runnable on this host."
+            echo "STOP: use the previously validated native fixdep recipe for this header archive."
+            exit 1
+          fi
+
+      - name: Build module
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.audit_only) }}
+        shell: bash
+        run: |
+          set -euxo pipefail
           cd "$DRIVER"
-          make -j2 ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
-            KSRC="$HDR" KVER=6.18.57-ophub \
-            2>&1 | tee "$RUNNER_TEMP/driver-build.log"
-
-          echo "===== BUILT MODULES ====="
-          find "$DRIVER" -type f -name '*.ko' -print
-          MODULE="$(find "$DRIVER" -type f \
-            -name 8189fs.ko -print -quit)"
-          test -n "$MODULE"
-
           mkdir -p "$GITHUB_WORKSPACE/output"
-          cp "$MODULE" "$GITHUB_WORKSPACE/output/8189fs.ko"
-          sha256sum "$GITHUB_WORKSPACE/output/8189fs.ko"
+
+          {
+            echo "Build timestamp: $(date -u +%FT%TZ)"
+            echo "Source commit: 876e627a5b6a8021700391b4249a4a31edfebe5c"
+            echo "Kernel release target: 6.18.57-ophub"
+            echo "Header directory: $HDR"
+            echo "Compiler:"
+            aarch64-none-linux-gnu-gcc --version
+            echo "Kernel configuration identity:"
+            sha256sum "$GITHUB_WORKSPACE/kernel-6.18.57.config"
+          } | tee "$GITHUB_WORKSPACE/output/build-metadata.txt"
+
+          make -j2 \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-none-linux-gnu- \
+            KSRC="$HDR" \
+            KVER=6.18.57-ophub \
+            2>&1 | tee "$GITHUB_WORKSPACE/output/driver-build.log"
+
+          KO="$(find . -type f -name 8189fs.ko -print -quit)"
+          test -n "$KO"
+          cp "$KO" "$GITHUB_WORKSPACE/output/8189fs.ko"
+
+          echo "=== Module metadata ==="
           file "$GITHUB_WORKSPACE/output/8189fs.ko"
+          /opt/arm-toolchain/bin/aarch64-none-linux-gnu-readelf -h \
+            "$GITHUB_WORKSPACE/output/8189fs.ko"
+          strings "$GITHUB_WORKSPACE/output/8189fs.ko" |
+            grep -E 'vermagic=|depends=|alias=|license=' || true
 
-      - name: Save compiler error log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: driver-build-log
-          path: ${{ runner.temp }}/driver-build.log
-          if-no-files-found: warn
-
-      - name: Upload module artifact
+      - name: Upload diagnostic build artifacts
+        if: ${{ always() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.audit_only)) }}
         uses: actions/upload-artifact@v4
         with:
           name: rtl8189fs-openwrt-6.18.57-ophub
-          path: output/8189fs.ko
-          if-no-files-found: error
-          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            output/8189fs.ko
+            output/driver-build.log
+            output/build-metadata.txt
