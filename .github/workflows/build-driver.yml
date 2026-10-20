@@ -83,6 +83,21 @@ jobs:
           echo "=== Header directory ==="
           echo "$HDR"
 
+          echo "=== Module.symvers ==="
+          wc -l "$HDR/Module.symvers"
+          sha256sum "$HDR/Module.symvers"
+          
+          echo "=== Kernel configuration ==="
+          grep -E '^(CONFIG_MODVERSIONS|CONFIG_CFG80211|CONFIG_MAC80211)=' \
+            "$HDR/.config" 2>/dev/null || true
+          
+          echo "=== Generated configuration ==="
+          grep -E '^(CONFIG_MODVERSIONS|CONFIG_CFG80211|CONFIG_MAC80211)=' \
+            "$HDR/include/config/auto.conf" 2>/dev/null || true
+          
+          echo "=== Header archive checksum ==="
+          sha256sum header-6.18.57-ophub.tar.gz
+
       - name: Download pinned upstream RTL8189FS source
         run: |
           set -eux
