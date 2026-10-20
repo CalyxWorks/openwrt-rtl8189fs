@@ -112,19 +112,37 @@ jobs:
           file "$HDR/scripts/basic/fixdep"
           file "$HDR/scripts/mod/modpost"
 
-      - name: Print affected driver callbacks
+      - name: Audit cfg80211 compatibility across driver
         shell: bash
         run: |
-          sed -n \
-            -e '2225,2260p' \
-            -e '5290,5330p' \
-            -e '5465,5505p' \
-            -e '5580,5620p' \
-            -e '5740,5790p' \
-            -e '6640,6690p' \
-            -e '7235,7285p' \
-            -e '9770,9885p' \
-            "$DRIVER/os_dep/linux/ioctl_cfg80211.c"
+          set -eu
+          SRC="$DRIVER"
+          HDR="$HDR"
+
+          echo "===== ALL 7.1.0 GUARDS IN DRIVER ====="
+          grep -R -n -B 4 -A 8 \
+            --include='*.c' --include='*.h' \
+            'KERNEL_VERSION(7, 1, 0)' "$SRC" || true
+
+          echo "===== STATION CALLBACK DEFINITIONS ====="
+          FILE="$SRC/os_dep/linux/ioctl_cfg80211.c"
+          grep -n -B 8 -A 24 -E \
+            'cfg80211_rtw_(get_station|add_station|del_station|change_station|dump_station)\(' \
+            "$FILE" || true
+
+          echo "===== REMAIN-ON-CHANNEL AND MGMT-TX DEFINITIONS ====="
+          grep -n -B 8 -A 35 -E \
+            'cfg80211_rtw_(remain_on_channel|cancel_remain_on_channel|mgmt_tx)\(' \
+            "$FILE" || true
+
+          echo "===== STATION NOTIFICATION CALLS ====="
+          grep -n -B 6 -A 8 -E \
+            'cfg80211_(new_sta|del_sta)\(' "$SRC" || true
+
+          echo "===== ACTUAL HEADER PROTOTYPES ====="
+          grep -n -B 3 -A 7 -E \
+            '(\*get_station|\*add_station|\*del_station|\*change_station|\*dump_station|\*remain_on_channel|\*cancel_remain_on_channel|\*mgmt_tx|cfg80211_new_sta\(|cfg80211_del_sta\()' \
+            "$HDR/include/net/cfg80211.h" || true
 
       - name: Diagnose cfg80211 header API
         shell: bash
