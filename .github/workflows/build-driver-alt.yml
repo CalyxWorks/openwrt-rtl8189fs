@@ -58,20 +58,27 @@ jobs:
           test -f "$HDR/Module.symvers"
           test -f "$HDR/include/generated/autoconf.h"
 
-      - name: Prepare kernel build utilities
+      - name: Rebuild host-side kernel utilities
         shell: bash
         run: |
           set -euxo pipefail
           HDR="$RUNNER_TEMP/headers"
 
-          if [ ! -x "$HDR/scripts/mod/modpost" ]; then
-            make -C "$HDR" \
-              ARCH=arm64 \
-              CROSS_COMPILE="$CROSS_COMPILE" \
-              scripts
-          fi
+          echo "=== Remove incompatible prebuilt modpost ==="
+          rm -f "$HDR/scripts/mod/modpost"
 
+          echo "=== Rebuild utilities for the GitHub runner ==="
+          make -C "$HDR" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            HOSTCC=gcc \
+            HOSTCXX=g++ \
+            scripts
+
+          echo "=== Verify modpost architecture ==="
           test -x "$HDR/scripts/mod/modpost"
+          file "$HDR/scripts/mod/modpost"
+          "$HDR/scripts/mod/modpost" --help || true
 
       - name: Download alternative RTL8189FS source
         shell: bash
