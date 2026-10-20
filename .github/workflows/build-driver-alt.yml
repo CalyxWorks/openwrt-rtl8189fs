@@ -203,6 +203,23 @@ jobs:
           grep -R -n -B 6 -A 8 -E \
             'cfg80211_(new_sta|del_sta)\(' "$SRC" || true
 
+            echo "===== PUBLIC MGMT-TX CALLBACK ====="
+            
+          grep -n -B 12 -A 75 \
+            'static .*cfg80211_rtw_mgmt_tx' \
+            "$FILE" || true
+          
+          echo "===== REMAIN-ON-CHANNEL CALLBACK REGISTRATION ====="
+          grep -n -B 8 -A 12 -E \
+            '\.remain_on_channel|\.cancel_remain_on_channel|\.mgmt_tx' \
+            "$FILE" || true
+          
+          echo "===== POWER-SAVING MAKEFILE RULES ====="
+          sed -n '45,75p' "$SRC/Makefile"
+          grep -n -B 5 -A 12 -E \
+            'CONFIG_POWER_SAVING|CONFIG_IPS_MODE|CONFIG_LPS_MODE' \
+            "$SRC/Makefile"
+
       - name: Diagnose actual cfg80211 header API
         shell: bash
         run: |
