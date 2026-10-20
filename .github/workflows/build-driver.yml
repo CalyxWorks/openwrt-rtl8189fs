@@ -121,7 +121,8 @@ jobs:
 
           cd "$DRIVER"
           make -j2 ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
-            KSRC="$HDR" KVER=6.18.57-ophub
+            KSRC="$HDR" KVER=6.18.57-ophub \
+            2>&1 | tee "$RUNNER_TEMP/driver-build.log"
 
           echo "===== BUILT MODULES ====="
           find "$DRIVER" -type f -name '*.ko' -print
@@ -133,6 +134,14 @@ jobs:
           cp "$MODULE" "$GITHUB_WORKSPACE/output/8189fs.ko"
           sha256sum "$GITHUB_WORKSPACE/output/8189fs.ko"
           file "$GITHUB_WORKSPACE/output/8189fs.ko"
+
+      - name: Save compiler error log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-build-log
+          path: ${{ runner.temp }}/driver-build.log
+          if-no-files-found: warn
 
       - name: Upload module artifact
         uses: actions/upload-artifact@v4
