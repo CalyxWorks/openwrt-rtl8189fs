@@ -58,18 +58,31 @@ jobs:
           test -f "$HDR/Module.symvers"
           test -f "$HDR/include/generated/autoconf.h"
 
-      - name: Restore kernel configuration and rebuild host utilities
+      - name: Rebuild host tools for GitHub runner
         shell: bash
         run: |
           set -euxo pipefail
           HDR="$RUNNER_TEMP/headers"
           CONFIG="$GITHUB_WORKSPACE/kernel-6.18.57.config"
 
-          echo "=== Verify saved kernel configuration ==="
           test -s "$CONFIG"
           cp "$CONFIG" "$HDR/.config"
 
-          echo "=== Prepare configuration ==="
+          echo "=== Remove ARM64 host executables ==="
+          rm -f "$HDR/scripts/kconfig/conf"
+          rm -f "$HDR/scripts/mod/modpost"
+
+          echo "=== Rebuild configuration utility natively ==="
+          make -C "$HDR" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            HOSTCC=gcc \
+            HOSTCXX=g++ \
+            scripts/kconfig/conf
+
+          file "$HDR/scripts/kconfig/conf"
+
+          echo "=== Prepare kernel configuration ==="
           make -C "$HDR" \
             ARCH=arm64 \
             CROSS_COMPILE="$CROSS_COMPILE" \
@@ -77,10 +90,7 @@ jobs:
             HOSTCXX=g++ \
             olddefconfig
 
-          echo "=== Remove incompatible modpost ==="
-          rm -f "$HDR/scripts/mod/modpost"
-
-          echo "=== Build host utilities ==="
+          echo "=== Build remaining host utilities ==="
           make -C "$HDR" \
             ARCH=arm64 \
             CROSS_COMPILE="$CROSS_COMPILE" \
@@ -88,10 +98,9 @@ jobs:
             HOSTCXX=g++ \
             scripts
 
-          echo "=== Verify modpost ==="
+          echo "=== Verify modpost architecture ==="
           test -x "$HDR/scripts/mod/modpost"
           file "$HDR/scripts/mod/modpost"
-          "$HDR/scripts/mod/modpost" --help || true
 
       - name: Download alternative RTL8189FS source
         shell: bash
