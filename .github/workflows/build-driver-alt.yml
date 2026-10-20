@@ -58,16 +58,29 @@ jobs:
           test -f "$HDR/Module.symvers"
           test -f "$HDR/include/generated/autoconf.h"
 
-      - name: Rebuild host-side kernel utilities
+      - name: Restore kernel configuration and rebuild host utilities
         shell: bash
         run: |
           set -euxo pipefail
           HDR="$RUNNER_TEMP/headers"
+          CONFIG="$GITHUB_WORKSPACE/kernel-6.18.57.config"
 
-          echo "=== Remove incompatible prebuilt modpost ==="
+          echo "=== Verify saved kernel configuration ==="
+          test -s "$CONFIG"
+          cp "$CONFIG" "$HDR/.config"
+
+          echo "=== Prepare configuration ==="
+          make -C "$HDR" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            HOSTCC=gcc \
+            HOSTCXX=g++ \
+            olddefconfig
+
+          echo "=== Remove incompatible modpost ==="
           rm -f "$HDR/scripts/mod/modpost"
 
-          echo "=== Rebuild utilities for the GitHub runner ==="
+          echo "=== Build host utilities ==="
           make -C "$HDR" \
             ARCH=arm64 \
             CROSS_COMPILE="$CROSS_COMPILE" \
@@ -75,7 +88,7 @@ jobs:
             HOSTCXX=g++ \
             scripts
 
-          echo "=== Verify modpost architecture ==="
+          echo "=== Verify modpost ==="
           test -x "$HDR/scripts/mod/modpost"
           file "$HDR/scripts/mod/modpost"
           "$HDR/scripts/mod/modpost" --help || true
